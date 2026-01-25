@@ -6,17 +6,32 @@ from .data.msvd_dataset import MSVDVideoCaptionDataset
 from .models.video_captioning_moe import VideoCaptioningMoE
 from .train.train_loop import train_model
 
-tokenizer = SimpleTokenizer(vocab_size=VOCAB_SIZE)
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-dataset = MSVDVideoCaptionDataset(...)
-loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    tokenizer = SimpleTokenizer(vocab_size=VOCAB_SIZE)
 
-model = VideoCaptioningMoE(
-    vocab_size=tokenizer.vocab_size_property,
-    embed_dim=EMBED_DIM,
-    num_heads=NUM_HEADS,
-    top_k=TOP_K,
-    num_layers=NUM_LAYERS
-).to(DEVICE)
+    dataset = MSVDVideoCaptionDataset(
+        video_dir=...,
+        csv_path=...,
+        txt_path=...,
+        tokenizer=tokenizer,
+        frames=NUM_FRAMES
+    )
 
-train_model(model, loader, None, tokenizer, device=DEVICE, epochs=2)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    model = VideoCaptioningMoE(
+        vocab_size=len(tokenizer.word2idx),
+        embed_dim=EMBED_DIM,
+        num_heads=NUM_HEADS,
+        top_k=TOP_K,
+        num_layers=NUM_LAYERS,
+        decoder_layers=6
+    ).to(device)
+
+    train_model(model, loader, None, tokenizer, device=device, epochs=2)
+
+if __name__ == "__main__":
+    main()
+

@@ -1,0 +1,21 @@
+# ---- Python virtual environments ----
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+pip-wheel-metadata/
+
+# ---- Python cache / compiled files ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- VS Code ----
+.vscode/
+
+# ---- macOS ----
+.DS_Store

@@ -41,6 +41,6 @@ class VideoEmbedder(nn.Module):
         return self.dropout(x)
 
 # Test embedding
-embedder = VideoEmbedder(EMBED_DIM, NUM_FRAMES, PATCH_SIZE).to(DEVICE)
-tokens = embedder(videos)
-print(f"Patch-embedded tokens shape: {tokens.shape}")
+# embedder = VideoEmbedder(EMBED_DIM, NUM_FRAMES, PATCH_SIZE).to(DEVICE)
+# tokens = embedder(videos)
+# print(f"Patch-embedded tokens shape: {tokens.shape}")

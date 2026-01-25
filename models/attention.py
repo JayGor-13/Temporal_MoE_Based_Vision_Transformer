@@ -15,7 +15,7 @@ class MultiHeadSelfAttention(nn.Module):
         return res + self.drop(attn_out)
 
 # Test attention
-attn_block = MultiHeadSelfAttention(EMBED_DIM, NUM_HEADS).to(DEVICE)
-attn_out = attn_block(tokens)
-print(f"After Attention: {attn_out.shape}")
-# → [2, 1569, 512]
+# attn_block = MultiHeadSelfAttention(EMBED_DIM, NUM_HEADS).to(DEVICE)
+# attn_out = attn_block(tokens)
+# print(f"After Attention: {attn_out.shape}")
+# # → [2, 1569, 512]
