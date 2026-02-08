@@ -30,7 +30,7 @@ def main():
         decoder_layers=6
     ).to(device)
 
-    train_model(model, loader, None, tokenizer, device=device, epochs=2)
+    train_model(model, loader, None, tokenizer, device=device, epochs=EPOCHS)
 
 if __name__ == "__main__":
     main()
