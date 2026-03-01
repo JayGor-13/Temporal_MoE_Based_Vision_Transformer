@@ -1,38 +1,26 @@
 import torch
-import torch.nn as nn
+from torch import nn
 
-from ..models.vit_encoder import TemporalMoEViT_Encoder
-from ..models.decoder import TransformerDecoder
-from ..config import NUM_FRAMES, PATCH_SIZE
-# =========================================================================
-# --- STEP 4: UPGRADE THE MASTER VideoCaptioningMoE MODEL ---
-# This model now correctly handles the auxiliary losses from the new encoder.
-# =========================================================================
+from config import CFG
+from models.decoder import TransformerDecoder
+from models.vit_encoder import TemporalMoEViTEncoder
+
 
 class VideoCaptioningMoE(nn.Module):
-    def __init__(self, vocab_size, embed_dim=512, num_heads=8,
-                 top_k=2, num_layers=6, decoder_layers=6):
+    def __init__(self, vocab_size: int, dense_only: bool = False):
         super().__init__()
-        
-        # Create an ENCODER that is just the TemporalMoEViT part
+        self.encoder = TemporalMoEViTEncoder(dense_only=dense_only)
+        self.gate = nn.Linear(CFG.embed_dim, CFG.embed_dim)  # alpha = sigmoid(Wg h_video)
+        self.decoder = TransformerDecoder(vocab_size, CFG.embed_dim, CFG.num_heads, CFG.num_layers, CFG.dropout)
 
-        self.encoder = TemporalMoEViT_Encoder(embed_dim, num_heads, top_k, num_layers)
-        
-        self.decoder = TransformerDecoder(
-            vocab_size=vocab_size,
-            d_model=embed_dim,
-            nhead=num_heads,
-            num_layers=decoder_layers
-        )
+    def forward(self, video_frames, tgt_ids):
+        text_state = torch.zeros(video_frames.size(0), CFG.embed_dim, device=video_frames.device)
+        if tgt_ids.numel() > 0:
+            text_state = self.decoder.embedding(tgt_ids).mean(dim=1)
 
-    def forward(self, video_frames, tgt_ids, expert_kwargs=None):
-        # We need to know whether to compute the aux losses
-        compute_losses = self.training 
-
-        # Encode video into memory and get auxiliary losses
-        memory, diagnostics = self.encoder(video_frames, expert_kwargs, compute_router_losses=compute_losses)
-        
-        # Decode captions conditioned on the video memory
+        memory, diagnostics = self.encoder(video_frames, text_state)
+        alpha = torch.sigmoid(self.gate(memory))
+        memory = alpha * memory
+        diagnostics["cross_modal_alpha_mean"] = alpha.mean()
         logits = self.decoder(tgt_ids, memory)
-        
         return logits, diagnostics

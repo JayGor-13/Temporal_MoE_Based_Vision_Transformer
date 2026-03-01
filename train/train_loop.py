@@ -1,94 +1,70 @@
+from pathlib import Path
+import json
+
 import torch
-from tqdm import tqdm
-import torch.nn as nn
-import os
-from ..train.losses import captioning_loss
-from ..utils.param_count import count_active_parameters
-from ..config import RESUME_CHECKPOINT_PATH, CHECKPOINT_SAVE_DIR, vocab_size
-def train_model(model, train_loader, val_loader, tokenizer, device='cuda', epochs=20):
-    
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    
-    scaler = torch.cuda.amp.GradScaler()
-    start_epoch = 0
+from torch.utils.data import DataLoader
 
-    if RESUME_CHECKPOINT_PATH and os.path.exists(RESUME_CHECKPOINT_PATH):
-        print(f"Resuming training from checkpoint: {RESUME_CHECKPOINT_PATH}")
-        checkpoint = torch.load(RESUME_CHECKPOINT_PATH)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"Resumed from the end of Epoch {start_epoch-1}. Starting Epoch {start_epoch}.")
-    else:
-        print("No resume checkpoint found. Starting training from scratch.")
+from config import CFG
+from train.losses import captioning_loss, clip_style_contrastive
+from train.eval import greedy_decode, beam_search_decode, coco_like_metrics
+from utils.misc import approximate_flops
+from utils.param_count import count_parameters
 
-    print(f"Training on {device}")
-    
-    for epoch in range(start_epoch, epochs):
-        model.train()
-        epoch_task_loss = 0.0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for batch in pbar:
-            video = batch['video'].to(device)
-            input_ids = batch['input_ids'].to(device)
-            targets = input_ids[:, 1:]
-            
-            optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast('cuda',):
-                # --- This is the full, correct forward and loss calculation ---
-                logits, diagnostics = model(video, input_ids[:, :-1])
-                
-                task_loss = criterion(logits.reshape(-1, vocab_size), targets.reshape(-1))
-                
-                total_aux_loss = 0.0
-                # --- FIX: Iterate over .items(), not .item() ---
-                if isinstance(diagnostics, dict):
-                    for key, value in diagnostics.items():
-                        if 'loss' in key:
-                            total_aux_loss += value
+def run_epoch(model, loader, optimizer, device, train=True):
+    model.train(train)
+    losses = []
+    for batch in loader:
+        video = batch["video"].to(device)
+        ids = batch["input_ids"].to(device)
+        logits, diagnostics = model(video, ids[:, :-1])
+        cap_loss = captioning_loss(logits, ids[:, 1:], label_smoothing=CFG.label_smoothing)
+        aux = sum(v for k, v in diagnostics.items() if "loss" in k and torch.is_tensor(v)) if diagnostics else 0.0
+        # CLIP-style pretraining component
+        v_emb = logits.mean(dim=1)
+        t_emb = model.decoder.embedding(ids).mean(dim=1)
+        c_loss = clip_style_contrastive(v_emb, t_emb, tau=CFG.tau)
+        loss = cap_loss + CFG.aux_loss_weight * aux + 0.1 * c_loss
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
+            optimizer.step()
+        losses.append(loss.item())
+    return sum(losses) / max(1, len(losses))
 
-                alpha = 0.01 
-                total_loss_batch = task_loss + alpha * total_aux_loss
 
-            # The full, correct AMP backward pass
-            scaler.scale(total_loss_batch).backward()
-            scaler.step(optimizer)
-            scaler.update()
+def evaluate(model, loader, device):
+    model.eval()
+    preds, refs = [], []
+    with torch.no_grad():
+        for batch in loader:
+            v = batch["video"].to(device)
+            g = greedy_decode(model, v, max_len=CFG.max_len)
+            preds.extend([" ".join(map(str, x.tolist())) for x in g])
+            refs.extend(batch["caption"])
+    return coco_like_metrics(preds, refs)
 
-            # --- FIX: Correctly accumulate the task loss ---
-            epoch_task_loss += task_loss.item()
-            # --- FIX: Cleaned up progress bar to show both losses ---
-            pbar.set_postfix({'TaskLoss': f'{task_loss.item():.4f}', 'AuxLoss': f'{total_aux_loss:.4f}'})
 
-        avg_loss = epoch_task_loss / len(train_loader)
-        
-        # We need a forward pass to update router stats for an accurate count
-        model.eval()
-        with torch.no_grad():
-            _ = model(video, input_ids[:, :-1])
-        active_params, total_params, active_by_layer = count_active_parameters(model)
-        
-        print(f"\nEpoch {epoch+1} finished. Avg Task Loss: {avg_loss:.4f}, Perplexity: {torch.exp(torch.tensor(avg_loss)):.2f}")
-        print(f"  Params -> Active: {active_params/1e6:.2f}M | Total: {total_params/1e6:.2f}M | Ratio: {active_params/total_params:.2%}")
-        for layer_name, experts in active_by_layer.items():
-            print(f"    - Layer '{layer_name}' active experts: {experts}")
+def run_training(model, train_ds, val_ds, seed, run_name):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    train_loader = DataLoader(train_ds, batch_size=min(CFG.finetune_batch_size, len(train_ds)))
+    val_loader = DataLoader(val_ds, batch_size=1)
 
-        # Checkpointing logic
-        checkpoint_data = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
-            'loss': avg_loss,
-        }
-        latest_path = os.path.join(CHECKPOINT_SAVE_DIR, 'latest_checkpoint.pth')
-        torch.save(checkpoint_data, latest_path)
-        print(f"✓ Checkpoint saved to {latest_path}\n")
+    opt = torch.optim.AdamW(model.parameters(), lr=CFG.finetune_lr, weight_decay=CFG.weight_decay)
+    train_loss = run_epoch(model, train_loader, opt, device, train=True)
+    metrics = evaluate(model, val_loader, device)
 
-    return model
+    batch = next(iter(val_loader))
+    beam = beam_search_decode(model, batch["video"].to(device), max_len=CFG.max_len, beam_size=5, length_penalty=CFG.length_penalty)
+    metrics["beam_example_len"] = int(beam.size(1))
+    metrics["train_loss"] = train_loss
+    metrics["seed"] = seed
+    metrics.update(count_parameters(model))
+    metrics["flops_approx"] = approximate_flops(CFG.num_frames * (224 // 16) ** 2, CFG.embed_dim, CFG.num_layers)
 
-# =========================================================================
+    out_dir = Path(CFG.results_dir) / run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    return metrics

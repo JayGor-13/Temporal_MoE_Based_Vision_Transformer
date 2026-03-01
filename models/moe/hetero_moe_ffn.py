@@ -1,79 +1,32 @@
 import torch
-import torch.nn as nn
+from torch import nn
 
-from .experts import (
-    Expert, MotionExpert, TextureExpert,
-    SceneExpert, FastChangeExpert, LanguageAlignedExpert
-)
-from .router import HeteroRouter
+from models.moe.experts import DenseFFN, Expert
+from models.moe.router import CaptionConditionedRouter
 
-# ============================================================
-# --- STEP 2: DEFINE THE ADVANCED HETEROGENEOUS MOE LAYER ---
-# This replaces the simple 'MoEFeedForward' class.
-# ============================================================
 
-class HeteroMoEFeedForward(nn.Module):
-    def __init__(self, embed_dim, top_k=2):
+class MoEFeedForward(nn.Module):
+    def __init__(self, embed_dim: int, num_experts: int = 8, top_k: int = 2, dense_only: bool = False):
         super().__init__()
-        self.embed_dim = embed_dim
-
-        # Define the committee of specialized experts internally
-        self.experts = nn.ModuleList([
-            MotionExpert(embed_dim),
-            TextureExpert(embed_dim),
-            SceneExpert(embed_dim),
-            FastChangeExpert(embed_dim),
-            LanguageAlignedExpert(embed_dim),
-            Expert(embed_dim), # Generic Expert 1
-            Expert(embed_dim), # Generic Expert 2
-            Expert(embed_dim), # Generic Expert 3
-        ])
-        self.num_experts = len(self.experts)
-
-        # Create the advanced router
-        self.router = HeteroRouter(embed_dim, self.num_experts, top_k=top_k)
-
-        # Register expert costs with the router
-        costs = torch.tensor([float(getattr(e, "cost", 1.0)) for e in self.experts], dtype=torch.float32)
-        self.router.register_buffer("costs", costs)
-
+        self.dense_only = dense_only
+        self.dense = DenseFFN(embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
+        self.experts = nn.ModuleList([Expert(embed_dim) for _ in range(num_experts)])
+        self.router = CaptionConditionedRouter(embed_dim, num_experts, top_k)
 
-    def forward(self, x, expert_kwargs=None, compute_router_losses=False):
-        B, S, D = x.shape
-        x_flat = x.view(-1, D)
+    def forward(self, x: torch.Tensor, text_state: torch.Tensor):
+        if self.dense_only:
+            return x + self.norm(self.dense(x)), {}
 
-        topk_idx, topk_probs, all_probs, router_losses = self.router(x_flat, compute_losses=compute_router_losses)
-        out_flat = torch.zeros_like(x_flat)
+        topi, topv, probs, losses = self.router(x, text_state)
+        b, s, d = x.shape
+        mixed = torch.zeros_like(x)
+        for bi in range(b):
+            out = 0
+            for k in range(topi.shape[1]):
+                e = self.experts[topi[bi, k].item()]
+                out = out + topv[bi, k] * e(x[bi])
+            mixed[bi] = out
 
-        for e_id, expert in enumerate(self.experts):
-            mask = (topk_idx == e_id).any(dim=1)
-            if mask.sum() == 0:
-                continue
-            
-            expert_in = x_flat[mask]
-            
-            # Safely pass kwargs only to experts that can accept them
-            if expert_kwargs is not None:
-                try:
-                    expert_out = expert(expert_in, **expert_kwargs)
-                except TypeError:
-                    expert_out = expert(expert_in)
-            else:
-                expert_out = expert(expert_in)
-            
-            # Calculate correct weights and combine
-            topk_idx_masked = topk_idx[mask]
-            topk_probs_masked = topk_probs[mask]
-            equal_mat = (topk_idx_masked == e_id)
-            gate_weights = (topk_probs_masked * equal_mat.float()).sum(dim=1, keepdim=True)
-            out_flat.index_add_(0, mask.nonzero().squeeze(), expert_out * gate_weights)
-
-        out = x + self.norm(out_flat.view(B, S, D))
-
-        # We will need these diagnostics for the full loss calculation
-        diagnostics = {}
-        if compute_router_losses:
-            diagnostics.update(router_losses)
-
-        return out, diagnostics
+        losses["routing_probs"] = probs
+        return x + self.norm(mixed), losses
