@@ -1,10 +1,10 @@
 from torch.utils.data import DataLoader
 
-from .config import *
-from .data.tokenizer import SimpleTokenizer
-from .data.msvd_dataset import MSVDVideoCaptionDataset
-from .models.video_captioning_moe import VideoCaptioningMoE
-from .train.train_loop import train_model
+from config import *
+from data.tokenizer import SimpleTokenizer
+from data.msvd_dataset import MSVDVideoCaptionDataset
+from models.video_captioning_moe import VideoCaptioningMoE
+from train.train_loop import train_model
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -12,9 +12,9 @@ def main():
     tokenizer = SimpleTokenizer(vocab_size=VOCAB_SIZE)
 
     dataset = MSVDVideoCaptionDataset(
-        video_dir=...,
-        csv_path=...,
-        txt_path=...,
+        video_dir="./dataset/video_files/video_files",
+        csv_path="./dataset/video_corpus.csv",
+        txt_path="./dataset/annotations.txt",
         tokenizer=tokenizer,
         frames=NUM_FRAMES
     )
@@ -30,8 +30,7 @@ def main():
         decoder_layers=6
     ).to(device)
 
-    train_model(model, loader, None, tokenizer, device=device, epochs=2)
+    train_model(model, loader, None, tokenizer, device=device, epochs=EPOCHS)
 
 if __name__ == "__main__":
     main()
-
