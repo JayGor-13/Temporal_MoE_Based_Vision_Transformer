@@ -4,3 +4,5 @@ pytest
 datasets
 huggingface_hub
 opencv-python-headless
+pycocoevalcap
+pycocotools

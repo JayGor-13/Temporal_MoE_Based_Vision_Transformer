@@ -1,5 +1,6 @@
 import re
 from collections import Counter
+from typing import Iterable, List
 
 import torch
 
@@ -15,7 +16,7 @@ class SimpleTokenizer:
         text = re.sub(r"[^a-z0-9\s]", "", text.lower())
         return text.split()
 
-    def build_vocab(self, texts):
+    def build_vocab(self, texts: Iterable[str]):
         freq = Counter()
         for t in texts:
             freq.update(self._tokenize_text(t))
@@ -27,12 +28,33 @@ class SimpleTokenizer:
     def encode(self, text, max_length=20):
         if not self.vocab_built:
             self.build_vocab([text])
-        ids = [self.word2idx["[CLS]"]] + [self.word2idx.get(t, 1) for t in self._tokenize_text(text)][: max_length - 2] + [self.word2idx["[SEP]"]]
+        ids = [self.word2idx["[CLS]"]] + [self.word2idx.get(t, 1) for t in self._tokenize_text(text)][: max_length - 2] + [
+            self.word2idx["[SEP]"]
+        ]
         attn = [1] * len(ids)
         while len(ids) < max_length:
             ids.append(0)
             attn.append(0)
         return {"input_ids": torch.tensor(ids, dtype=torch.long), "attention_mask": torch.tensor(attn, dtype=torch.long)}
+
+    def decode(self, ids: torch.Tensor | List[int]) -> str:
+        if isinstance(ids, torch.Tensor):
+            ids = ids.detach().cpu().tolist()
+
+        tokens = []
+        for idx in ids:
+            if idx == self.word2idx["[SEP]"]:
+                break
+            if idx in (self.word2idx["[PAD]"], self.word2idx["[CLS]"]):
+                continue
+            token = self.idx2word.get(int(idx), "[UNK]")
+            if token.startswith("[") and token.endswith("]"):
+                continue
+            tokens.append(token)
+        return " ".join(tokens).strip()
+
+    def batch_decode(self, batch_ids: torch.Tensor) -> List[str]:
+        return [self.decode(row) for row in batch_ids]
 
     def __call__(self, text, max_length=20, **kwargs):
         return self.encode(text, max_length=max_length)

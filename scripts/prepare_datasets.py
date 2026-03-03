@@ -76,12 +76,23 @@ SPECS: Dict[str, DatasetSpec] = {
 VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 
 
-def _is_prepared(dataset_dir: Path) -> bool:
-    manifests_ok = all((dataset_dir / f"{s}.json").exists() for s in ("train", "val", "test"))
-    videos_dir = dataset_dir / "videos"
-    videos_ok = videos_dir.exists() and any(videos_dir.iterdir())
-    return manifests_ok and videos_ok
+def _manifest_has_video_paths(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        rows = json.loads(path.read_text())
+    except Exception:
+        return False
+    if not rows:
+        return False
+    return all(isinstance(r, dict) and bool(str(r.get("video_path", "")).strip()) for r in rows)
 
+
+def _is_prepared(dataset_dir: Path) -> bool:
+    manifests_ok = all(_manifest_has_video_paths(dataset_dir / f"{s}.json") for s in ("train", "val", "test"))
+    videos_dir = dataset_dir / "videos"
+    videos_ok = videos_dir.exists() and any(videos_dir.rglob("*"))
+    return manifests_ok and videos_ok
 
 def _load_split(repo_id: str, config_name: Optional[str], split_name: str, token: Optional[str]) -> List[Dict[str, Any]]:
     if config_name:
@@ -392,3 +403,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
