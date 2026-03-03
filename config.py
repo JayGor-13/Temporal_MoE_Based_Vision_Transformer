@@ -16,8 +16,12 @@ class Config:
     results_dir: str = "results"
     data_fraction: float = 1.0
     download_fraction_by_dataset: Dict[str, float] = field(default_factory=lambda: {"msvd": 1.0, "msrvtt": 1.0})
-    max_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 2000, "msrvtt": 11000})
-    train_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 1200, "msrvtt": 9000})
+    # Full-data defaults for supported datasets.
+    # MSVD uses official train/val/test.
+    # MSR-VTT uses train_9k + test_1k, with val derived from train_9k,
+    # so train(8000) + val(1000) + test(1000) covers the full 10k videos.
+    max_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 1970, "msrvtt": 10000})
+    train_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 1200, "msrvtt": 8000})
     val_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 100, "msrvtt": 1000})
     test_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 670, "msrvtt": 1000})
     max_captions_per_video_by_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 20, "msrvtt": 20})

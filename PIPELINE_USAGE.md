@@ -19,6 +19,7 @@ Main controls live in `config.py`:
 - training schedule (`pretrain_epochs`, `finetune_epochs`, batch sizes)
 - ablation toggles (`run_ablations`, `run_dense_baseline`)
 - multi-seed eval (`seeds`)
+- defaults are set for full MSVD and full MSR-VTT split coverage
 
 ## 3) Run end-to-end locally
 ```bash
@@ -42,3 +43,7 @@ All artifacts are written under `results/`:
 - `results/benchmarks/model_aggregates.json`
 - `results/benchmarks/benchmark_comparison.json`
 - `results/ablations/ablation_aggregates.json`
+
+
+## 6) Team handoff / sequence guide
+For a full collaborator-focused Docker + data-download playbook, see `COLLAB_DOCKER_RUN_GUIDE.md`.
