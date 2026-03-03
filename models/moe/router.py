@@ -21,5 +21,5 @@ class CaptionConditionedRouter(nn.Module):
         topv, topi = torch.topk(probs, k=self.top_k, dim=-1)
         topv = topv / (topv.sum(dim=-1, keepdim=True) + 1e-8)
         entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1).mean()
-        aux = probs.var(dim=0).mean()
+        aux = probs.var(dim=0, unbiased=False).mean()
         return topi, topv, probs, {"routing_entropy": entropy, "load_balance_loss": aux}
