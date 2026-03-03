@@ -42,3 +42,7 @@ All artifacts are written under `results/`:
 - `results/benchmarks/model_aggregates.json`
 - `results/benchmarks/benchmark_comparison.json`
 - `results/ablations/ablation_aggregates.json`
+
+
+## 6) Team handoff / sequence guide
+For a full collaborator-focused Docker + data-download playbook, see `COLLAB_DOCKER_RUN_GUIDE.md`.
