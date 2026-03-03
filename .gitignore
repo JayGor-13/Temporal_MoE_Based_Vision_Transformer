@@ -21,3 +21,7 @@ __pycache__/
 .DS_Store
 
 revert.txt
+
+# ---- Generated experiment/data artifacts ----
+results/
+data_store/*/videos/

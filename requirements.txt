@@ -1,3 +1,6 @@
 torch
 numpy
 pytest
+datasets
+huggingface_hub
+opencv-python-headless

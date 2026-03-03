@@ -11,19 +11,32 @@ from utils.misc import approximate_flops
 from utils.param_count import count_parameters
 
 
+def _masked_mean(x, mask):
+    mask = mask.unsqueeze(-1).type_as(x)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return (x * mask).sum(dim=1) / denom
+
+
 def run_epoch(model, loader, optimizer, device, train=True):
     model.train(train)
     losses = []
     for batch in loader:
         video = batch["video"].to(device)
         ids = batch["input_ids"].to(device)
+        attn = batch["attention_mask"].to(device)
+
         logits, diagnostics = model(video, ids[:, :-1])
         cap_loss = captioning_loss(logits, ids[:, 1:], label_smoothing=CFG.label_smoothing)
         aux = sum(v for k, v in diagnostics.items() if "loss" in k and torch.is_tensor(v)) if diagnostics else 0.0
-        # CLIP-style pretraining component
-        v_emb = logits.mean(dim=1)
-        t_emb = model.decoder.embedding(ids).mean(dim=1)
+
+        # CLIP-style pretraining component: keep both embeddings in model embed space.
+        v_emb = diagnostics.get("video_emb")
+        if v_emb is None:
+            probs = torch.softmax(logits, dim=-1)
+            v_emb = (probs @ model.decoder.embedding.weight).mean(dim=1)
+        t_emb = _masked_mean(model.decoder.embedding(ids), attn)
         c_loss = clip_style_contrastive(v_emb, t_emb, tau=CFG.tau)
+
         loss = cap_loss + CFG.aux_loss_weight * aux + 0.1 * c_loss
         if train:
             optimizer.zero_grad()
@@ -49,7 +62,10 @@ def evaluate(model, loader, device):
 def run_training(model, train_ds, val_ds, seed, run_name):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    train_loader = DataLoader(train_ds, batch_size=min(CFG.finetune_batch_size, len(train_ds)))
+    train_bs = min(CFG.finetune_batch_size, len(train_ds))
+    if device.type == "cpu":
+        train_bs = min(train_bs, 1)
+    train_loader = DataLoader(train_ds, batch_size=train_bs)
     val_loader = DataLoader(val_ds, batch_size=1)
 
     opt = torch.optim.AdamW(model.parameters(), lr=CFG.finetune_lr, weight_decay=CFG.weight_decay)

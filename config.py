@@ -1,18 +1,26 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Tuple
 
 
 @dataclass
 class Config:
     seed: int = 42
-    seeds: List[int] = (42, 123, 999)
+    seeds: List[int] = (42,)
+    datasets: Tuple[str, ...] = ("msvd", "msrvtt")
+    run_dense_baseline: bool = False
 
     # data
     data_root: str = "data_store"
     results_dir: str = "results"
-    data_fraction: float = 0.01  # intentionally tiny for local smoke runs
-    num_frames: int = 16
+    data_fraction: float = 1.0
+    download_fraction_by_dataset: Dict[str, float] = field(default_factory=lambda: {"msvd": 0.01, "msrvtt": 0.01})
+    max_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 3, "msrvtt": 3})
+    train_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 1, "msrvtt": 1})
+    val_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 1, "msrvtt": 1})
+    test_videos_per_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 1, "msrvtt": 1})
+    max_captions_per_video_by_dataset: Dict[str, int] = field(default_factory=lambda: {"msvd": 1, "msrvtt": 1})
+    num_frames: int = 2
     max_len: int = 20
     vocab_size: int = 5000
 
@@ -27,7 +35,7 @@ class Config:
 
     # optimization
     pretrain_batch_size: int = 64
-    finetune_batch_size: int = 32
+    finetune_batch_size: int = 1
     pretrain_lr: float = 3e-4
     finetune_lr: float = 1e-4
     weight_decay: float = 0.01

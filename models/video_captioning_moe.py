@@ -19,6 +19,9 @@ class VideoCaptioningMoE(nn.Module):
             text_state = self.decoder.embedding(tgt_ids).mean(dim=1)
 
         memory, diagnostics = self.encoder(video_frames, text_state)
+        # CLS token acts as the global video representation for auxiliary alignment losses.
+        diagnostics["video_emb"] = memory[:, 0, :]
+
         alpha = torch.sigmoid(self.gate(memory))
         memory = alpha * memory
         diagnostics["cross_modal_alpha_mean"] = alpha.mean()
