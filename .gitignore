@@ -1,11 +1,6 @@
-# ---- Python virtual environments ----
+__pycache__/
 venv/
-.venv/
-env/
-ENV/
-virtualenv/
-pip-wheel-metadata/
-
+dataset/
 # ---- Python cache / compiled files ----
 .pytest_cache/
 __pycache__/

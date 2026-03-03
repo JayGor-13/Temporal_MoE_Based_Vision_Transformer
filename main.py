@@ -1,7 +1,11 @@
 from collections import defaultdict
 import json
-import math
-from pathlib import Path
+
+from config import *
+from data.tokenizer import SimpleTokenizer
+from data.msvd_dataset import MSVDVideoCaptionDataset
+from models.video_captioning_moe import VideoCaptioningMoE
+from train.train_loop import train_model
 
 from config import CFG, as_dict
 from data.tokenizer import SimpleTokenizer
@@ -11,32 +15,13 @@ from train.train_loop import run_training
 from utils.misc import set_seed
 
 
-ABLATIONS = {
-    "A1_dense_only": {
-        "model": {"dense_only": True},
-        "train": {},
-    },
-    "A2_no_caption_conditioning": {
-        "model": {"no_caption_conditioning": True},
-        "train": {},
-    },
-    "A3_no_aux_loss": {
-        "model": {},
-        "train": {"no_aux_loss": True},
-    },
-    "A4_no_temporal_bias": {
-        "model": {"no_temporal_bias": True},
-        "train": {},
-    },
-    "A5_no_cross_modal_gating": {
-        "model": {"no_cross_modal_gating": True},
-        "train": {},
-    },
-    "A6_no_contrastive_pretrain": {
-        "model": {},
-        "train": {"no_contrastive_pretrain": True},
-    },
-}
+    dataset = MSVDVideoCaptionDataset(
+        video_dir="./dataset/video_files/video_files",
+        csv_path="./dataset/video_corpus.csv",
+        txt_path="./dataset/annotations.txt",
+        tokenizer=tokenizer,
+        frames=NUM_FRAMES
+    )
 
 
 def ensure_results_tree():
@@ -44,6 +29,7 @@ def ensure_results_tree():
     for sub in ["metrics", "raw", "plots", "benchmarks", "ablations"]:
         (root / sub).mkdir(parents=True, exist_ok=True)
 
+    train_model(model, loader, None, tokenizer, device=device, epochs=EPOCHS)
 
 def save_benchmark_template():
     path = Path(CFG.results_dir) / "benchmarks" / "reported_baselines.json"

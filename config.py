@@ -34,36 +34,11 @@ class Config:
     dropout: float = 0.1
     length_penalty: float = 0.7
 
-    # optimization
-    pretrain_batch_size: int = 32
-    finetune_batch_size: int = 8
-    pretrain_lr: float = 3e-4
-    finetune_lr: float = 1e-4
-    weight_decay: float = 0.01
-    warmup_ratio: float = 0.1
-    pretrain_epochs: int = 3
-    finetune_epochs: int = 10
-    grad_clip: float = 1.0
-    tau: float = 0.07
-    label_smoothing: float = 0.1
-    aux_loss_weight: float = 0.01
-    contrastive_loss_weight: float = 0.1
-
-    # execution
-    num_workers: int = 2
-    pin_memory: bool = True
-
-    # ablation toggles
-    no_caption_conditioning: bool = False
-    no_aux_loss: bool = False
-    no_temporal_bias: bool = False
-    no_cross_modal_gating: bool = False
-    no_contrastive_pretrain: bool = False
+# Tokenizer
+MAX_LEN = 20
+VOCAB_SIZE = 5000
+NUM_SAMPLES = 1970
 
 
-CFG = Config()
-Path(CFG.results_dir).mkdir(parents=True, exist_ok=True)
-
-
-def as_dict():
-    return asdict(CFG)
+RESUME_CHECKPOINT_PATH = None 
+CHECKPOINT_SAVE_DIR = "/kaggle/working/checkpoints/"
