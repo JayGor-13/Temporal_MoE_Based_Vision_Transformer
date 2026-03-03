@@ -296,6 +296,17 @@ def prepare_dataset(
     else:
         val_raw = train_raw
 
+    if spec.val_split is None:
+        # Validation split is derived from the train split, so combined budgets
+        # cannot exceed available train videos.
+        unique_train = len({_row_video_name(r, spec.video_field) for r in train_raw if _row_video_name(r, spec.video_field)})
+        if train_budget + val_budget > unique_train:
+            raise ValueError(
+                f"[{name}] train+val budgets exceed available train videos for derived val split: "
+                f"{train_budget}+{val_budget} > {unique_train}. "
+                "Adjust config.train_videos_per_dataset / val_videos_per_dataset for full split coverage."
+            )
+
     archive = hf_hub_download(
         repo_id=spec.repo_id,
         filename=spec.video_archive,
