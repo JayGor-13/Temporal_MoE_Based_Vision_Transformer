@@ -1,39 +1,44 @@
 # Pipeline Usage
 
-## 1) Prepare real datasets from Hugging Face
+## 1) Prepare full MSVD + MSR-VTT datasets from Hugging Face
 ```bash
-python scripts/prepare_datasets.py --root data_store
+python scripts/prepare_datasets.py --root data_store --datasets msvd msrvtt --refresh
 ```
-Supported datasets:
-- `msvd` (`friedrichor/MSVD`)
-- `msrvtt` (`friedrichor/MSR-VTT`)
+If needed for gated access:
+```bash
+python scripts/prepare_datasets.py --root data_store --datasets msvd msrvtt --refresh --hf-token <your_token>
+```
 
 Generated files:
 - `data_store/<dataset>/videos/*`
 - `data_store/<dataset>/{train,val,test}.json`
 
-Sampling controls are in `config.py` (per dataset):
-- `download_fraction_by_dataset`
-- `max_videos_per_dataset`
-- `train_videos_per_dataset`
-- `val_videos_per_dataset`
-- `test_videos_per_dataset`
+## 2) Configure training/ablations
+Main controls live in `config.py`:
+- full-data sampling knobs (`download_fraction_by_dataset`, split budgets)
+- training schedule (`pretrain_epochs`, `finetune_epochs`, batch sizes)
+- ablation toggles (`run_ablations`, `run_dense_baseline`)
+- multi-seed eval (`seeds`)
 
-Default config is laptop-friendly: max `10` videos per dataset, train on `4`, validate on `1`, test on `2`.
-
-If you need gated access, pass an HF token:
-```bash
-python scripts/prepare_datasets.py --root data_store --hf-token <your_token>
-```
-
-## 2) Run end-to-end locally
+## 3) Run end-to-end locally
 ```bash
 bash run_pipeline.sh
 ```
+Notes:
+- `REFRESH_DATA=1` by default in `run_pipeline.sh`.
+- Set `REFRESH_DATA=0` to reuse existing manifests/videos.
+- Set `HF_TOKEN=<token>` when needed.
 
-## 3) Run end-to-end in Docker (single command wrapper)
+## 4) Run in Docker
 ```bash
 bash run_docker_pipeline.sh
 ```
+This mounts both `results/` and `data_store/`.
 
-All artifacts are written under `results/`.
+## 5) Outputs
+All artifacts are written under `results/`:
+- per-run folders: checkpoints, metrics, history, predictions
+- `results/metrics/all_runs.json`
+- `results/benchmarks/model_aggregates.json`
+- `results/benchmarks/benchmark_comparison.json`
+- `results/ablations/ablation_aggregates.json`

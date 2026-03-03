@@ -10,6 +10,16 @@ class VideoEmbedder(nn.Module):
         tokens_per_frame = (img_size // patch_size) ** 2
         self.pos = nn.Parameter(torch.zeros(1, 1 + tokens_per_frame * num_frames, embed_dim))
 
+    def _position_slice(self, token_count: int) -> torch.Tensor:
+        if token_count <= self.pos.size(1):
+            return self.pos[:, :token_count]
+
+        # If runtime frame count is larger than configured count, extend by reusing
+        # the last learned position embedding instead of failing hard.
+        extra = token_count - self.pos.size(1)
+        tail = self.pos[:, -1:, :].expand(1, extra, -1)
+        return torch.cat([self.pos, tail], dim=1)
+
     def forward(self, x: torch.Tensor):
         # [B,T,3,H,W]
         b, t, c, h, w = x.shape
@@ -20,4 +30,4 @@ class VideoEmbedder(nn.Module):
         x = torch.cat(patches, dim=1)
         cls = self.cls.expand(b, -1, -1)
         x = torch.cat([cls, x], dim=1)
-        return x + self.pos[:, : x.size(1)]
+        return x + self._position_slice(x.size(1))
