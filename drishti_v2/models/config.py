@@ -11,12 +11,13 @@ import yaml
 class DRISHTIConfig:
     """Master configuration for the DRISHTI-CORE v2 pipeline."""
 
-    image_channels: int = 3
+    image_channels: int = 1
     image_height: int = 448
     image_width: int = 448
 
     ldmi_scales: tuple[int, ...] = (7, 15, 31, 63)
     use_ldmi: bool = True
+    use_sobel_edge: bool = True
 
     motion_cnn_channels: tuple[int, ...] = (32, 64, 64)
     use_motion_gate: bool = True
@@ -26,6 +27,7 @@ class DRISHTIConfig:
 
     num_crops: int = 8
     crop_size: int = 64
+    crop_scales: tuple[float, ...] = (1.0, 2.0, 4.0)
     dense_grid_size: int = 4
     border_width_frac: float = 0.07
     scan_period: int = 4
@@ -62,6 +64,7 @@ class DRISHTIConfig:
     w_gate_sparsity: float = 0.01
     w_temporal_consistency: float = 0.3
     w_trajectory_smoothness: float = 0.1
+    w_subpixel_offset: float = 1.0
     sigma_spatial_consist: float = 0.1
 
     tracker_dist_threshold: float = 0.15
@@ -71,7 +74,7 @@ class DRISHTIConfig:
     dataset_name: str = "anti_uav"
     data_root: str | None = None
     frames_root: str | None = None
-    modality: str = "visible"
+    modality: str = "infrared"
     box_format: str = "xywh"
     clip_stride: int = 4
     frame_stride: int = 1
@@ -94,6 +97,7 @@ class DRISHTIConfig:
     def __post_init__(self) -> None:
         self.ldmi_scales = tuple(self.ldmi_scales)
         self.motion_cnn_channels = tuple(self.motion_cnn_channels)
+        self.crop_scales = tuple(float(scale) for scale in self.crop_scales)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "DRISHTIConfig":
@@ -117,19 +121,29 @@ class DRISHTIConfig:
 
     @property
     def motion_input_channels(self) -> int:
-        return self.image_channels * (5 if self.use_ldmi else 3)
+        if not self.use_ldmi:
+            return 3 * self.image_channels
+        return 3 * self.image_channels + 6 + int(self.use_sobel_edge)
+
+    @property
+    def encoder_in_channels(self) -> int:
+        return self.image_channels * len(self.crop_scales)
 
     @property
     def dense_num_crops(self) -> int:
         return self.dense_grid_size * self.dense_grid_size
 
     def validate(self) -> None:
+        if self.image_channels not in {1, 3}:
+            raise ValueError("image_channels must be 1 or 3")
         if self.num_crops < 1:
             raise ValueError("num_crops must be positive")
         if self.dense_grid_size < 1:
             raise ValueError("dense_grid_size must be positive")
         if self.crop_size < 2:
             raise ValueError("crop_size must be at least 2")
+        if not self.crop_scales or any(scale <= 0.0 for scale in self.crop_scales):
+            raise ValueError("crop_scales must contain positive values")
         if not 0.0 < self.border_width_frac < 0.5:
             raise ValueError("border_width_frac must be in (0, 0.5)")
         if self.scan_period < 1:

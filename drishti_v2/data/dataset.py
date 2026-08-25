@@ -12,6 +12,7 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from drishti_v2.data.augmentations import VideoAugmentation
 from drishti_v2.data.utils import list_image_files, xywh_to_cxcywh, xyxy_to_cxcywh
 
 MODELSCOPE_ANTI_UAV_URL = "https://modelscope.cn/datasets/ly261666/3rd_Anti-UAV"
@@ -192,6 +193,7 @@ class _AntiUAVBase(Dataset):
         frame_stride: int,
         image_channels: int,
         box_format: str,
+        augment: bool = False,
     ) -> None:
         self.split = split
         self.modality = modality
@@ -202,6 +204,7 @@ class _AntiUAVBase(Dataset):
         self.frame_stride = frame_stride
         self.image_channels = image_channels
         self.box_format = box_format
+        self.augmentor = VideoAugmentation(train=True) if augment and split == "train" else None
         if image_channels not in {1, 3}:
             raise ValueError("image_channels must be 1 or 3")
 
@@ -213,6 +216,15 @@ class _AntiUAVBase(Dataset):
         sequence_name: str,
         frame_indices: list[int],
     ) -> dict[str, Any]:
+        if self.augmentor is not None:
+            frames, targets, metadata = self.augmentor.apply(
+                frames,
+                targets,
+                {"image_ids": image_ids, "frame_indices": frame_indices},
+            )
+            assert metadata is not None
+            image_ids = metadata["image_ids"]
+            frame_indices = metadata["frame_indices"]
         frame_targets = targets
         return {
             "frames": torch.stack(frames, dim=0),
@@ -241,8 +253,20 @@ class AntiUAVExtractedFrameDataset(_AntiUAVBase):
         image_channels: int = 3,
         box_format: str = "xywh",
         sequence_ids: set[str] | None = None,
+        augment: bool = False,
     ) -> None:
-        super().__init__(split, modality, num_frames, height, width, clip_stride, frame_stride, image_channels, box_format)
+        super().__init__(
+            split,
+            modality,
+            num_frames,
+            height,
+            width,
+            clip_stride,
+            frame_stride,
+            image_channels,
+            box_format,
+            augment,
+        )
         self.frames_root = Path(frames_root)
         self.sequences = self._discover_sequences(sequence_ids)
         self.samples = [
@@ -309,8 +333,20 @@ class AntiUAVRGBTVideoDataset(_AntiUAVBase):
         box_format: str = "xywh",
         label_dir_name: str = "label_new",
         sequence_ids: set[str] | None = None,
+        augment: bool = False,
     ) -> None:
-        super().__init__(split, modality, num_frames, height, width, clip_stride, frame_stride, image_channels, box_format)
+        super().__init__(
+            split,
+            modality,
+            num_frames,
+            height,
+            width,
+            clip_stride,
+            frame_stride,
+            image_channels,
+            box_format,
+            augment,
+        )
         self.data_root = Path(data_root)
         self.label_dir_name = label_dir_name
         self.sequences = self._discover_sequences(sequence_ids)
@@ -421,8 +457,10 @@ class AntiUAVDataset(AntiUAVExtractedFrameDataset):
         box_format: str = "xywh",
         augment: bool = False,
         sequence_filter: list[str] | None = None,
+        image_channels: int | None = None,
     ) -> None:
-        del augment
+        if image_channels is None:
+            image_channels = 1 if modality == "infrared" else 3
         super().__init__(
             frames_root=data_root,
             split=split,
@@ -432,9 +470,10 @@ class AntiUAVDataset(AntiUAVExtractedFrameDataset):
             width=frame_size[1],
             clip_stride=clip_stride,
             frame_stride=frame_stride,
-            image_channels=3,
+            image_channels=image_channels,
             box_format=box_format,
             sequence_ids=set(sequence_filter) if sequence_filter else None,
+            augment=augment,
         )
 
 

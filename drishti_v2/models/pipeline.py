@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
+from drishti_v2.assignment import linear_sum_assignment
 from drishti_v2.models.config import DRISHTIConfig
 from drishti_v2.models.crop_encoder import CropEncoder
 from drishti_v2.models.crop_proposal import CropProposalEngine
@@ -27,12 +28,20 @@ class PipelineOutput:
     moe_features: Tensor
     objectness_logits: Tensor
     crop_boxes: Tensor
+    center_offsets: Tensor
     boxes: Tensor
+    crop_scale: tuple[float, float]
     balance_loss: Tensor
     moe_diagnostics: MoEDiagnostics
     motion_gate_confidence: Tensor
     used_dense_mode: bool
     all_heatmaps: list[Tensor] | None = None
+    proposal_centers_seq: list[Tensor] | None = None
+    proposal_sources_seq: list[Tensor] | None = None
+    objectness_logits_seq: list[Tensor] | None = None
+    crop_boxes_seq: list[Tensor] | None = None
+    center_offsets_seq: list[Tensor] | None = None
+    boxes_seq: list[Tensor] | None = None
 
 
 class DRISHTIPipeline(nn.Module):
@@ -42,7 +51,11 @@ class DRISHTIPipeline(nn.Module):
         super().__init__()
         config.validate()
         self.config = config
-        self.ldmi = LocalDifferentialMotion(config.image_channels, config.ldmi_scales)
+        self.ldmi = LocalDifferentialMotion(
+            config.image_channels,
+            config.ldmi_scales,
+            use_sobel_edge=config.use_sobel_edge,
+        )
         self.motion_cnn = MotionCNN(
             config.image_channels,
             config.motion_cnn_channels,
@@ -54,7 +67,7 @@ class DRISHTIPipeline(nn.Module):
             else None
         )
         self.crop_engine = CropProposalEngine(config)
-        self.encoder = CropEncoder(config.encoder_feature_dim, in_channels=config.image_channels)
+        self.encoder = CropEncoder(config.encoder_feature_dim, in_channels=config.encoder_in_channels)
         self.temporal = CausalTemporalFusion(
             feature_dim=config.encoder_feature_dim + 1,
             out_dim=config.encoder_feature_dim,
@@ -71,10 +84,14 @@ class DRISHTIPipeline(nn.Module):
             ffn_dim=config.expert_ffn_dim,
             dropout=config.moe_dropout,
             dense=config.dense_moe,
+            num_sources=5,
+            use_source_bias=True,
         )
         self.head = DetectionHead(config.encoder_feature_dim, config.head_hidden_dim)
         self._stream_buffer: list[Tensor] = []
         self._stream_feature_buffer: list[Tensor] = []
+        self._stream_center_buffer: list[Tensor] = []
+        self._stream_source_buffer: list[Tensor] = []
         if config.encoder_frozen:
             self.encoder.freeze()
 
@@ -83,13 +100,39 @@ class DRISHTIPipeline(nn.Module):
         t1 = max(0, t_idx - 1)
         return torch.cat([frames[:, t0], frames[:, t1], frames[:, t_idx]], dim=1)
 
-    def _boxes_to_global(self, crop_boxes: Tensor, centers: Tensor, frame_shape: tuple[int, int]) -> Tensor:
+    def _crop_scale(self, frame_shape: tuple[int, int]) -> tuple[float, float]:
         height, width = frame_shape
-        crop_w = self.config.crop_size / float(width)
-        crop_h = self.config.crop_size / float(height)
+        crop_w = max(self.config.crop_size - 1, 1) / float(max(width - 1, 1))
+        crop_h = max(self.config.crop_size - 1, 1) / float(max(height - 1, 1))
+        return crop_w, crop_h
+
+    def _boxes_to_global(
+        self,
+        crop_boxes: Tensor,
+        centers: Tensor,
+        frame_shape: tuple[int, int],
+        center_offsets: Tensor | None = None,
+        heatmap_size: tuple[int, int] | None = None,
+    ) -> Tensor:
+        crop_w, crop_h = self._crop_scale(frame_shape)
+        corrected_centers = centers
+        if center_offsets is not None:
+            if heatmap_size is None:
+                height, width = frame_shape
+                heatmap_size = (max((height + 3) // 4, 1), max((width + 3) // 4, 1))
+            heatmap_h, heatmap_w = heatmap_size
+            correction = torch.stack(
+                [
+                    center_offsets[..., 0] / float(max(heatmap_w - 1, 1)),
+                    center_offsets[..., 1] / float(max(heatmap_h - 1, 1)),
+                ],
+                dim=-1,
+            )
+            corrected_centers = centers + correction
+
         global_boxes = crop_boxes.clone()
-        global_boxes[..., 0] = centers[..., 0] + (crop_boxes[..., 0] - 0.5) * crop_w
-        global_boxes[..., 1] = centers[..., 1] + (crop_boxes[..., 1] - 0.5) * crop_h
+        global_boxes[..., 0] = corrected_centers[..., 0] + (crop_boxes[..., 0] - 0.5) * crop_w
+        global_boxes[..., 1] = corrected_centers[..., 1] + (crop_boxes[..., 1] - 0.5) * crop_h
         global_boxes[..., 2] = crop_boxes[..., 2] * crop_w
         global_boxes[..., 3] = crop_boxes[..., 3] * crop_h
         return global_boxes.clamp(0.0, 1.0)
@@ -108,15 +151,77 @@ class DRISHTIPipeline(nn.Module):
             return False
         return bool((confidence < self.config.motion_gate_threshold).any().detach().cpu().item())
 
-    def _fit_num_crops(self, features: Tensor, num_crops: int) -> Tensor:
-        current = features.shape[1]
-        if current == num_crops:
-            return features
-        if current > num_crops:
-            return features[:, :num_crops]
-        pad_shape = (features.shape[0], num_crops - current, features.shape[2])
-        padding = features.new_zeros(pad_shape)
-        return torch.cat([features, padding], dim=1)
+    def _align_temporal_history(
+        self,
+        features: list[Tensor],
+        centers: list[Tensor],
+        sources: list[Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        """Align historical proposal slots to the newest proposal layout."""
+
+        reference_centers = centers[-1]
+        reference_sources = sources[-1]
+        batch, reference_crops, _ = reference_centers.shape
+        aligned_features: list[Tensor] = []
+        aligned_centers: list[Tensor] = []
+        aligned_sources: list[Tensor] = []
+        padding_steps: list[Tensor] = []
+
+        for time_idx, (step_features, step_centers, step_sources) in enumerate(zip(features, centers, sources)):
+            if time_idx == len(features) - 1:
+                aligned_features.append(step_features)
+                aligned_centers.append(step_centers)
+                aligned_sources.append(step_sources)
+                padding_steps.append(torch.zeros(batch, reference_crops, dtype=torch.bool, device=step_features.device))
+                continue
+
+            batch_features = []
+            batch_centers = []
+            batch_sources = []
+            batch_padding = []
+            for batch_idx in range(batch):
+                spatial_cost = torch.cdist(reference_centers[batch_idx].detach(), step_centers[batch_idx].detach())
+                source_cost = (
+                    reference_sources[batch_idx, :, None] != step_sources[batch_idx, None, :]
+                ).to(spatial_cost.dtype)
+                row_indices, col_indices = linear_sum_assignment(spatial_cost + 2.0 * source_cost)
+                matches = {int(row): int(col) for row, col in zip(row_indices.tolist(), col_indices.tolist())}
+
+                feature_rows = []
+                center_rows = []
+                source_rows = []
+                padded_rows = []
+                for row in range(reference_crops):
+                    if row in matches:
+                        col = matches[row]
+                        feature_rows.append(step_features[batch_idx, col])
+                        center_rows.append(step_centers[batch_idx, col])
+                        source_rows.append(step_sources[batch_idx, col])
+                        padded_rows.append(False)
+                    else:
+                        feature_rows.append(step_features.new_zeros(step_features.shape[-1]))
+                        center_rows.append(reference_centers[batch_idx, row])
+                        source_rows.append(step_sources.new_tensor(self.crop_engine.PAD))
+                        padded_rows.append(True)
+                batch_features.append(torch.stack(feature_rows))
+                batch_centers.append(torch.stack(center_rows))
+                batch_sources.append(torch.stack(source_rows))
+                batch_padding.append(torch.tensor(padded_rows, dtype=torch.bool, device=step_features.device))
+
+            aligned_features.append(torch.stack(batch_features))
+            aligned_centers.append(torch.stack(batch_centers))
+            aligned_sources.append(torch.stack(batch_sources))
+            padding_steps.append(torch.stack(batch_padding))
+
+        padding_mask = torch.stack(padding_steps, dim=1)
+        if not padding_mask.any():
+            padding_mask = None
+        return (
+            torch.stack(aligned_features, dim=1),
+            torch.stack(aligned_centers, dim=1),
+            torch.stack(aligned_sources, dim=1),
+            padding_mask,
+        )
 
     def _forward_single(
         self,
@@ -146,7 +251,10 @@ class DRISHTIPipeline(nn.Module):
         gate_confidence = torch.stack(confidences, dim=1)
         dense_mode = self._use_dense_mode(gate_confidence)
         features: list[Tensor] = []
-        last: tuple[Tensor, Tensor, Tensor, Tensor, Tensor] | None = None
+        centers_history: list[Tensor] = []
+        sources_history: list[Tensor] = []
+        encoded_history: list[Tensor] = []
+        scores_history: list[Tensor] = []
 
         for t_idx in range(time):
             guided = guided_centers if t_idx == time - 1 else None
@@ -158,15 +266,62 @@ class DRISHTIPipeline(nn.Module):
                 dense=dense_mode,
             )
             features.append(augmented)
-            last = (heatmap, centers, scores, sources, encoded)
+            centers_history.append(centers)
+            sources_history.append(sources)
+            encoded_history.append(encoded)
+            scores_history.append(scores)
 
-        assert last is not None
-        sequence = torch.stack(features[-self.config.temporal_window :], dim=1)
-        fused = self.temporal(sequence)
-        moe_features, moe_diagnostics = self.moe(fused)
-        logits, crop_boxes = self.head(moe_features)
-        heatmap, centers, scores, sources, encoded = last
-        global_boxes = self._boxes_to_global(crop_boxes, centers, (height, width))
+        fused_history: list[Tensor] = []
+        moe_history: list[Tensor] = []
+        diagnostics_history: list[MoEDiagnostics] = []
+        logits_history: list[Tensor] = []
+        crop_boxes_history: list[Tensor] = []
+        offsets_history: list[Tensor] = []
+        boxes_history: list[Tensor] = []
+
+        for t_idx in range(time):
+            start = max(0, t_idx + 1 - self.config.temporal_window)
+            sequence, centers_seq, sources_seq, padding_mask = self._align_temporal_history(
+                features[start : t_idx + 1],
+                centers_history[start : t_idx + 1],
+                sources_history[start : t_idx + 1],
+            )
+            fused_step = self.temporal(
+                sequence,
+                centers_seq=centers_seq,
+                source_labels_seq=sources_seq,
+                padding_mask=padding_mask,
+            )
+            moe_step, diagnostics = self.moe(fused_step, source_labels=sources_history[t_idx])
+            logits_step, crop_boxes_step, offsets_step = self.head(moe_step)
+            boxes_step = self._boxes_to_global(
+                crop_boxes_step,
+                centers_history[t_idx],
+                (height, width),
+                offsets_step,
+                tuple(heatmaps[t_idx].shape[-2:]),
+            )
+            fused_history.append(fused_step)
+            moe_history.append(moe_step)
+            diagnostics_history.append(diagnostics)
+            logits_history.append(logits_step)
+            crop_boxes_history.append(crop_boxes_step)
+            offsets_history.append(offsets_step)
+            boxes_history.append(boxes_step)
+
+        heatmap = heatmaps[-1]
+        centers = centers_history[-1]
+        scores = scores_history[-1]
+        sources = sources_history[-1]
+        encoded = encoded_history[-1]
+        fused = fused_history[-1]
+        moe_features = moe_history[-1]
+        moe_diagnostics = diagnostics_history[-1]
+        logits = logits_history[-1]
+        crop_boxes = crop_boxes_history[-1]
+        center_offsets = offsets_history[-1]
+        global_boxes = boxes_history[-1]
+        balance_loss = torch.stack([item.balance_loss for item in diagnostics_history]).mean()
         return PipelineOutput(
             heatmap=heatmap,
             proposal_centers=centers,
@@ -177,12 +332,20 @@ class DRISHTIPipeline(nn.Module):
             moe_features=moe_features,
             objectness_logits=logits,
             crop_boxes=crop_boxes,
+            center_offsets=center_offsets,
             boxes=global_boxes,
-            balance_loss=moe_diagnostics.balance_loss,
+            crop_scale=self._crop_scale((height, width)),
+            balance_loss=balance_loss,
             moe_diagnostics=moe_diagnostics,
             motion_gate_confidence=gate_confidence[:, -1],
             used_dense_mode=dense_mode,
             all_heatmaps=heatmaps,
+            proposal_centers_seq=centers_history,
+            proposal_sources_seq=sources_history,
+            objectness_logits_seq=logits_history,
+            crop_boxes_seq=crop_boxes_history,
+            center_offsets_seq=offsets_history,
+            boxes_seq=boxes_history,
         )
 
     @torch.no_grad()
@@ -197,7 +360,8 @@ class DRISHTIPipeline(nn.Module):
         self.eval()
         frames_for_triplet = [item[:, : self.config.image_channels] for item in self._stream_buffer[-2:]]
         while len(frames_for_triplet) < 2:
-            frames_for_triplet.insert(0, frame)
+            pad_frame = frames_for_triplet[0] if frames_for_triplet else frame
+            frames_for_triplet.insert(0, pad_frame)
         triplet = torch.cat([frames_for_triplet[-2], frames_for_triplet[-1], frame], dim=1)
         heatmap, confidence = self._motion_step(triplet)
         dense_mode = self._use_dense_mode(confidence)
@@ -208,15 +372,30 @@ class DRISHTIPipeline(nn.Module):
         self._stream_buffer = self._stream_buffer[-self.config.temporal_window :]
         self._stream_feature_buffer.append(augmented.detach())
         self._stream_feature_buffer = self._stream_feature_buffer[-self.config.temporal_window :]
-        num_crops = augmented.shape[1]
-        seq = [self._fit_num_crops(item, num_crops) for item in self._stream_feature_buffer]
-        if len(seq) < self.config.temporal_window:
-            seq = [seq[0]] * (self.config.temporal_window - len(seq)) + seq
-        sequence = torch.stack(seq[-self.config.temporal_window :], dim=1)
-        fused = self.temporal(sequence)
-        moe_features, moe_diagnostics = self.moe(fused)
-        logits, crop_boxes = self.head(moe_features)
-        global_boxes = self._boxes_to_global(crop_boxes, centers, frame.shape[-2:])
+        self._stream_center_buffer.append(centers.detach())
+        self._stream_center_buffer = self._stream_center_buffer[-self.config.temporal_window :]
+        self._stream_source_buffer.append(sources.detach())
+        self._stream_source_buffer = self._stream_source_buffer[-self.config.temporal_window :]
+        sequence, centers_seq, sources_seq, padding_mask = self._align_temporal_history(
+            self._stream_feature_buffer,
+            self._stream_center_buffer,
+            self._stream_source_buffer,
+        )
+        fused = self.temporal(
+            sequence,
+            centers_seq=centers_seq,
+            source_labels_seq=sources_seq,
+            padding_mask=padding_mask,
+        )
+        moe_features, moe_diagnostics = self.moe(fused, source_labels=sources)
+        logits, crop_boxes, center_offsets = self.head(moe_features)
+        global_boxes = self._boxes_to_global(
+            crop_boxes,
+            centers,
+            frame.shape[-2:],
+            center_offsets,
+            tuple(heatmap.shape[-2:]),
+        )
         return PipelineOutput(
             heatmap=heatmap,
             proposal_centers=centers,
@@ -227,14 +406,24 @@ class DRISHTIPipeline(nn.Module):
             moe_features=moe_features,
             objectness_logits=logits,
             crop_boxes=crop_boxes,
+            center_offsets=center_offsets,
             boxes=global_boxes,
+            crop_scale=self._crop_scale(frame.shape[-2:]),
             balance_loss=moe_diagnostics.balance_loss,
             moe_diagnostics=moe_diagnostics,
             motion_gate_confidence=confidence,
             used_dense_mode=dense_mode,
             all_heatmaps=[heatmap],
+            proposal_centers_seq=[centers],
+            proposal_sources_seq=[sources],
+            objectness_logits_seq=[logits],
+            crop_boxes_seq=[crop_boxes],
+            center_offsets_seq=[center_offsets],
+            boxes_seq=[global_boxes],
         )
 
     def reset_stream(self) -> None:
         self._stream_buffer.clear()
         self._stream_feature_buffer.clear()
+        self._stream_center_buffer.clear()
+        self._stream_source_buffer.clear()

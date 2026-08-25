@@ -10,15 +10,15 @@ def _set_trainable(module: nn.Module, trainable: bool) -> None:
 
 
 def apply_training_stage(model: nn.Module, stage: str) -> None:
-    """Apply staged freezing rules from the implementation plan."""
+    """Apply staged freezing rules while protecting frozen normalization state."""
 
     stage = stage.lower()
+    model.eval()
     for parameter in model.parameters():
         parameter.requires_grad = False
 
     if stage in {"stage1", "detector"}:
         _set_trainable(model.motion_cnn, True)
-        _set_trainable(model.encoder, True)
         _set_trainable(model.head, True)
         if getattr(model, "motion_gate", None) is not None:
             _set_trainable(model.motion_gate, True)
@@ -27,6 +27,8 @@ def apply_training_stage(model: nn.Module, stage: str) -> None:
     elif stage in {"stage3", "moe"}:
         _set_trainable(model.moe, True)
     elif stage in {"stage4", "finetune", "e2e", "all"}:
+        if hasattr(model, "encoder") and hasattr(model.encoder, "unfreeze"):
+            model.encoder.unfreeze()
         for parameter in model.parameters():
             parameter.requires_grad = True
         model.train()

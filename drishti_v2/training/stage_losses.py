@@ -4,9 +4,10 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
+import torch.nn.functional as F
 
+from drishti_v2.assignment import linear_sum_assignment
 from drishti_v2.models.config import DRISHTIConfig
-from drishti_v2.models.motion_cnn import MotionCNN
 from drishti_v2.models.pipeline import PipelineOutput
 from drishti_v2.training.ciou_loss import ciou_loss
 from drishti_v2.training.focal_loss import heatmap_focal_loss, sigmoid_focal_loss
@@ -21,73 +22,67 @@ def last_targets(targets: list) -> list[dict]:
 def make_gt_heatmaps(targets: list[dict], heatmap_size: tuple[int, int], device: torch.device) -> Tensor:
     batch = len(targets)
     height, width = heatmap_size
-    
     heatmaps = torch.zeros(batch, 1, height, width, device=device)
-    
-    centers = []
-    valid_mask = []
-    for target in targets:
-        boxes = target.get("boxes", torch.empty(0, 4))
-        if boxes.numel() > 0:
-            centers.append(boxes[0, :2])
-            valid_mask.append(True)
-        else:
-            centers.append(torch.zeros(2))
-            valid_mask.append(False)
-            
-    valid_mask = torch.tensor(valid_mask, device=device, dtype=torch.bool)
-    if not valid_mask.any():
-        return heatmaps
-        
-    centers = torch.stack(centers, dim=0).to(device)
-    
-    y = torch.arange(height, device=device, dtype=centers.dtype).view(1, 1, height, 1)
-    x = torch.arange(width, device=device, dtype=centers.dtype).view(1, 1, 1, width)
-    
-    centers_x = (centers[:, 0].clamp(0, 1) * (width - 1)).view(batch, 1, 1, 1)
-    centers_y = (centers[:, 1].clamp(0, 1) * (height - 1)).view(batch, 1, 1, 1)
-    
-    sigma = 2.0
-    gaussian = torch.exp(-((x - centers_x) ** 2 + (y - centers_y) ** 2) / (2.0 * sigma**2))
-    
-    heatmaps = torch.where(valid_mask.view(batch, 1, 1, 1), gaussian, heatmaps)
+    for batch_idx, target in enumerate(targets):
+        boxes = target.get("boxes", torch.empty(0, 4)).to(device)
+        if boxes.numel() == 0:
+            continue
+        dtype = boxes.dtype if boxes.is_floating_point() else torch.float32
+        boxes = boxes.to(dtype=dtype)
+        x = torch.arange(width, device=device, dtype=dtype).view(1, 1, width)
+        y = torch.arange(height, device=device, dtype=dtype).view(1, height, 1)
+        center_x = (boxes[:, 0].clamp(0, 1) * max(width - 1, 1)).view(-1, 1, 1)
+        center_y = (boxes[:, 1].clamp(0, 1) * max(height - 1, 1)).view(-1, 1, 1)
+        half_w = boxes[:, 2].clamp_min(0.0) * max(width - 1, 1) / 2.0
+        half_h = boxes[:, 3].clamp_min(0.0) * max(height - 1, 1) / 2.0
+        sigma = torch.maximum(half_w, half_h).div(3.0).clamp_min(1.0).view(-1, 1, 1)
+        gaussian = torch.exp(-((x - center_x).square() + (y - center_y).square()) / (2.0 * sigma.square()))
+        heatmaps[batch_idx, 0] = gaussian.amax(dim=0).to(heatmaps.dtype)
     return heatmaps.clamp(0.0, 1.0)
 
 
-def assign_crops(output: PipelineOutput, targets: list[dict]) -> tuple[Tensor, Tensor]:
-    """Assign each GT box to the nearest crop center, computed on CPU to avoid GPU-CPU sync stalls."""
-    device = output.proposal_centers.device
-    batch, num_crops, _ = output.proposal_centers.shape
-    
-    centers_cpu = output.proposal_centers.detach().cpu()
-    crop_boxes_cpu = output.crop_boxes.detach().cpu()
-    boxes_cpu = output.boxes.detach().cpu()
-    
-    labels = torch.zeros(batch, num_crops, 1, dtype=output.objectness_logits.dtype)
-    box_targets = torch.zeros(batch, num_crops, 4, dtype=output.crop_boxes.dtype)
+def assign_crops(
+    proposal_centers: Tensor,
+    objectness_logits: Tensor,
+    crop_boxes: Tensor,
+    targets: list[dict],
+    crop_scale: tuple[float, float],
+    heatmap_size: tuple[int, int],
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Globally assign distinct crops to GTs and build prediction-independent targets."""
+
+    batch, num_crops, _ = proposal_centers.shape
+    labels = objectness_logits.new_zeros(batch, num_crops, 1)
+    box_targets = crop_boxes.new_zeros(batch, num_crops, 4)
+    offset_targets = crop_boxes.new_zeros(batch, num_crops, 2)
+    scale = crop_boxes.new_tensor(crop_scale)
+    heatmap_h, heatmap_w = heatmap_size
+    heatmap_span = crop_boxes.new_tensor([max(heatmap_w - 1, 1), max(heatmap_h - 1, 1)])
 
     for batch_idx, target in enumerate(targets):
-        boxes = target.get("boxes", torch.empty(0, 4)).detach().cpu()
+        boxes = target.get("boxes", torch.empty(0, 4)).detach().to(
+            device=proposal_centers.device,
+            dtype=proposal_centers.dtype,
+        )
         if boxes.numel() == 0:
             continue
-        distances = torch.cdist(centers_cpu[batch_idx], boxes[:, :2])
-        argmin_indices = distances.argmin(dim=0)
-        unique_crops = argmin_indices.unique()
-        
-        for crop_idx in unique_crops:
-            crop_idx_item = crop_idx.item()
-            gt_idx = distances[crop_idx_item].argmin().item()
+
+        # GT rows and crop columns produce a one-to-one assignment whenever K >= N_gt.
+        cost = torch.cdist(boxes[:, :2].detach(), proposal_centers[batch_idx].detach())
+        gt_indices, crop_indices = linear_sum_assignment(cost)
+        for gt_idx, crop_idx in zip(gt_indices.tolist(), crop_indices.tolist()):
             gt = boxes[gt_idx]
-            labels[batch_idx, crop_idx_item, 0] = 1.0
+            center = proposal_centers[batch_idx, crop_idx].detach()
+            labels[batch_idx, crop_idx, 0] = 1.0
 
-            global_size = boxes_cpu[batch_idx, crop_idx_item, 2:].clamp_min(1e-6)
-            crop_size = crop_boxes_cpu[batch_idx, crop_idx_item, 2:].clamp_min(1e-6)
-            crop_scale = global_size / crop_size
-            rel_xy = (gt[:2] - centers_cpu[batch_idx, crop_idx_item]) / crop_scale + 0.5
-            rel_wh = gt[2:] / crop_scale
-            box_targets[batch_idx, crop_idx_item] = torch.cat([rel_xy, rel_wh]).clamp(0.0, 1.0)
+            target_offset = ((gt[:2] - center) * heatmap_span).clamp(-0.5, 0.5)
+            corrected_target_center = center + target_offset / heatmap_span
+            relative_xy = (gt[:2] - corrected_target_center) / scale + 0.5
+            relative_wh = gt[2:] / scale
+            box_targets[batch_idx, crop_idx] = torch.cat([relative_xy, relative_wh])
+            offset_targets[batch_idx, crop_idx] = target_offset
 
-    return labels.to(device), box_targets.to(device)
+    return labels, box_targets, offset_targets
 
 
 class DetectionLossMixin:
@@ -97,20 +92,74 @@ class DetectionLossMixin:
     heatmap_beta: float
 
     def detection_terms(self, output: PipelineOutput, targets: list) -> dict[str, Tensor]:
-        targets = last_targets(targets)
-        heatmap_size = tuple(output.heatmap.shape[-2:])
-        gt_heatmap = make_gt_heatmaps(targets, heatmap_size, output.heatmap.device).to(output.heatmap.dtype)
-        heatmap = heatmap_focal_loss(output.heatmap, gt_heatmap, self.heatmap_alpha, self.heatmap_beta)
+        heatmaps = output.all_heatmaps or [output.heatmap]
+        centers_seq = output.proposal_centers_seq or [output.proposal_centers]
+        logits_seq = output.objectness_logits_seq or [output.objectness_logits]
+        crop_boxes_seq = output.crop_boxes_seq or [output.crop_boxes]
+        offsets_seq = output.center_offsets_seq or [output.center_offsets]
+        steps = min(len(heatmaps), len(centers_seq), len(logits_seq), len(crop_boxes_seq), len(offsets_seq))
 
-        labels, box_targets = assign_crops(output, targets)
-        cls = sigmoid_focal_loss(output.objectness_logits, labels, self.focal_gamma, self.focal_alpha)
-        positive = labels.squeeze(-1) > 0.5
-        bbox = (
-            ciou_loss(output.crop_boxes[positive], box_targets[positive])
-            if positive.any()
-            else output.objectness_logits.sum() * 0.0
-        )
-        return {"heatmap": heatmap, "cls": cls, "bbox": bbox, "labels": labels}
+        heatmap_losses: list[Tensor] = []
+        cls_losses: list[Tensor] = []
+        bbox_losses: list[Tensor] = []
+        offset_losses: list[Tensor] = []
+        labels_seq: list[Tensor] = []
+
+        for time_idx in range(steps):
+            step_targets = _targets_at_time(targets, time_idx)
+            heatmap_size = tuple(heatmaps[time_idx].shape[-2:])
+            gt_heatmap = make_gt_heatmaps(
+                step_targets,
+                heatmap_size,
+                heatmaps[time_idx].device,
+            ).to(heatmaps[time_idx].dtype)
+            heatmap_losses.append(
+                heatmap_focal_loss(heatmaps[time_idx], gt_heatmap, self.heatmap_alpha, self.heatmap_beta)
+            )
+
+            labels, box_targets, offset_targets = assign_crops(
+                centers_seq[time_idx],
+                logits_seq[time_idx],
+                crop_boxes_seq[time_idx],
+                step_targets,
+                output.crop_scale,
+                heatmap_size,
+            )
+            labels_seq.append(labels.squeeze(-1))
+            cls_losses.append(
+                sigmoid_focal_loss(logits_seq[time_idx], labels, self.focal_gamma, self.focal_alpha)
+            )
+            positive = labels.squeeze(-1) > 0.5
+            if positive.any():
+                bbox_losses.append(ciou_loss(crop_boxes_seq[time_idx][positive], box_targets[positive]))
+                offset_losses.append(F.smooth_l1_loss(offsets_seq[time_idx][positive], offset_targets[positive]))
+            else:
+                zero = logits_seq[time_idx].sum() * 0.0
+                bbox_losses.append(zero)
+                offset_losses.append(zero)
+
+        if not heatmap_losses:
+            raise ValueError("Pipeline output did not contain any supervised time steps")
+        return {
+            "heatmap": torch.stack(heatmap_losses).mean(),
+            "cls": torch.stack(cls_losses).mean(),
+            "bbox": torch.stack(bbox_losses).mean(),
+            "offset": torch.stack(offset_losses).mean(),
+            "labels": labels_seq[-1].unsqueeze(-1),
+            "labels_seq": labels_seq,
+        }
+
+
+def _targets_at_time(targets: list, time_idx: int) -> list[dict]:
+    if not targets or not isinstance(targets[0], list):
+        return targets
+    result = []
+    for clip in targets:
+        if not clip:
+            result.append({"boxes": torch.empty(0, 4)})
+        else:
+            result.append(clip[min(time_idx, len(clip) - 1)])
+    return result
 
 
 class Stage1Loss(nn.Module, DetectionLossMixin):
@@ -119,6 +168,7 @@ class Stage1Loss(nn.Module, DetectionLossMixin):
         w_hm: float = 1.0,
         w_cls: float = 1.0,
         w_box: float = 2.0,
+        w_offset: float = 1.0,
         w_motion: float = 0.5,
         w_gate: float = 0.01,
         focal_gamma: float = 2.0,
@@ -131,6 +181,7 @@ class Stage1Loss(nn.Module, DetectionLossMixin):
         self.w_hm = w_hm
         self.w_cls = w_cls
         self.w_box = w_box
+        self.w_offset = w_offset
         self.w_motion = w_motion
         self.w_gate = w_gate
         self.focal_gamma = focal_gamma
@@ -152,6 +203,7 @@ class Stage1Loss(nn.Module, DetectionLossMixin):
             self.w_hm * terms["heatmap"]
             + self.w_cls * terms["cls"]
             + self.w_box * terms["bbox"]
+            + self.w_offset * terms["offset"]
             + self.w_motion * motion
             + self.w_gate * gate
         )
@@ -160,6 +212,7 @@ class Stage1Loss(nn.Module, DetectionLossMixin):
             "heatmap": terms["heatmap"],
             "cls": terms["cls"],
             "bbox": terms["bbox"],
+            "offset": terms["offset"],
             "motion_disp": motion,
             "gate": gate,
             "balance": output.balance_loss,
@@ -172,6 +225,7 @@ class Stage2Loss(nn.Module, DetectionLossMixin):
         w_hm: float = 0.5,
         w_cls: float = 1.0,
         w_box: float = 2.0,
+        w_offset: float = 1.0,
         w_tc: float = 0.3,
         w_sm: float = 0.1,
         sigma_spatial: float = 0.1,
@@ -184,6 +238,7 @@ class Stage2Loss(nn.Module, DetectionLossMixin):
         self.w_hm = w_hm
         self.w_cls = w_cls
         self.w_box = w_box
+        self.w_offset = w_offset
         self.w_tc = w_tc
         self.w_sm = w_sm
         self.sigma_spatial = sigma_spatial
@@ -201,6 +256,9 @@ class Stage2Loss(nn.Module, DetectionLossMixin):
         boxes_seq: list[Tensor] | None = None,
     ) -> dict[str, Tensor]:
         terms = self.detection_terms(output, targets)
+        logits_seq = logits_seq or output.objectness_logits_seq
+        centers_seq = centers_seq or output.proposal_centers_seq
+        boxes_seq = boxes_seq or output.boxes_seq
         zero = output.objectness_logits.sum() * 0.0
         temporal = (
             temporal_consistency_loss(logits_seq, centers_seq, self.sigma_spatial)
@@ -209,13 +267,14 @@ class Stage2Loss(nn.Module, DetectionLossMixin):
         )
         smooth = zero
         if boxes_seq is not None:
-            labels = terms["labels"].squeeze(-1)
-            smooth = trajectory_smoothness_loss(boxes_seq, [labels] * len(boxes_seq))
+            labels_seq = terms["labels_seq"]
+            smooth = trajectory_smoothness_loss(boxes_seq, labels_seq[-len(boxes_seq) :])
 
         total = (
             self.w_hm * terms["heatmap"]
             + self.w_cls * terms["cls"]
             + self.w_box * terms["bbox"]
+            + self.w_offset * terms["offset"]
             + self.w_tc * temporal
             + self.w_sm * smooth
         )
@@ -224,6 +283,7 @@ class Stage2Loss(nn.Module, DetectionLossMixin):
             "heatmap": terms["heatmap"],
             "cls": terms["cls"],
             "bbox": terms["bbox"],
+            "offset": terms["offset"],
             "temporal_consist": temporal,
             "traj_smooth": smooth,
             "balance": output.balance_loss,
@@ -235,6 +295,7 @@ class Stage3Loss(nn.Module, DetectionLossMixin):
         self,
         w_cls: float = 1.0,
         w_box: float = 2.0,
+        w_offset: float = 1.0,
         w_bal: float = 0.01,
         w_zloss: float = 0.001,
         focal_gamma: float = 2.0,
@@ -245,6 +306,7 @@ class Stage3Loss(nn.Module, DetectionLossMixin):
         super().__init__()
         self.w_cls = w_cls
         self.w_box = w_box
+        self.w_offset = w_offset
         self.w_bal = w_bal
         self.w_zloss = w_zloss
         self.focal_gamma = focal_gamma
@@ -255,11 +317,18 @@ class Stage3Loss(nn.Module, DetectionLossMixin):
     def forward(self, output: PipelineOutput, targets: list) -> dict[str, Tensor]:
         terms = self.detection_terms(output, targets)
         z_loss = output.moe_diagnostics.router_z_loss
-        total = self.w_cls * terms["cls"] + self.w_box * terms["bbox"] + self.w_bal * output.balance_loss + self.w_zloss * z_loss
+        total = (
+            self.w_cls * terms["cls"]
+            + self.w_box * terms["bbox"]
+            + self.w_offset * terms["offset"]
+            + self.w_bal * output.balance_loss
+            + self.w_zloss * z_loss
+        )
         return {
             "loss": total,
             "cls": terms["cls"],
             "bbox": terms["bbox"],
+            "offset": terms["offset"],
             "balance": output.balance_loss,
             "z_loss": z_loss,
         }
@@ -271,6 +340,7 @@ class Stage4Loss(nn.Module):
         self.stage1 = Stage1Loss(
             w_motion=0.3,
             w_gate=(config.w_gate_sparsity if config else 0.01),
+            w_offset=(config.w_subpixel_offset if config else 1.0),
             focal_gamma=(config.focal_gamma if config else 2.0),
             focal_alpha=(config.focal_alpha if config else 0.25),
         )
@@ -278,9 +348,11 @@ class Stage4Loss(nn.Module):
             w_hm=0.5,
             w_tc=0.15,
             w_sm=0.05,
+            w_offset=(config.w_subpixel_offset if config else 1.0),
             sigma_spatial=(config.sigma_spatial_consist if config else 0.1),
         )
         self.stage3 = Stage3Loss(
+            w_offset=(config.w_subpixel_offset if config else 1.0),
             w_bal=(config.moe_balance_weight if config else 0.01),
             w_zloss=(config.router_z_loss_weight if config else 0.001),
         )
@@ -289,12 +361,19 @@ class Stage4Loss(nn.Module):
         s1 = self.stage1(output, targets, kwargs.get("all_heatmaps"))
         s2 = self.stage2(output, targets, kwargs.get("logits_seq"), kwargs.get("centers_seq"), kwargs.get("boxes_seq"))
         s3 = self.stage3(output, targets)
-        total = s1["loss"] + s2["temporal_consist"] + s2["traj_smooth"] + s3["z_loss"]
+        total = (
+            s1["loss"]
+            + self.stage2.w_tc * s2["temporal_consist"]
+            + self.stage2.w_sm * s2["traj_smooth"]
+            + self.stage3.w_bal * s3["balance"]
+            + self.stage3.w_zloss * s3["z_loss"]
+        )
         return {
             "loss": total,
             "heatmap": s1["heatmap"],
             "cls": s1["cls"],
             "bbox": s1["bbox"],
+            "offset": s1["offset"],
             "motion_disp": s1["motion_disp"],
             "temporal_consist": s2["temporal_consist"],
             "traj_smooth": s2["traj_smooth"],
@@ -330,6 +409,7 @@ class StageLossFactory:
             "heatmap_alpha": config.heatmap_focal_alpha,
             "heatmap_beta": config.heatmap_focal_beta,
             "w_motion": config.w_motion_displacement,
+            "w_offset": config.w_subpixel_offset,
             "w_gate": config.w_gate_sparsity,
             "w_tc": config.w_temporal_consistency,
             "w_sm": config.w_trajectory_smoothness,

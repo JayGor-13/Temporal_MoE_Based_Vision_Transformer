@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--output-dir", default="results/train")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--resume-checkpoint", default=None)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -63,6 +64,7 @@ def main() -> None:
         epochs=args.epochs or defaults["epochs"],
         lr=args.lr or defaults["lr"],
         checkpoint_name=f"{args.stage}_best.pt",
+        resume_checkpoint=args.resume_checkpoint,
     )
     print(f"Training complete. Results written to {Path(args.output_dir).resolve()}")
     print(f"Final epoch: {history[-1] if history else {}}")

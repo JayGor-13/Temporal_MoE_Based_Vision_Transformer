@@ -43,20 +43,33 @@ def motion_displacement_loss(
     device = heatmaps[0].device
     dtype = heatmaps[0].dtype
     gt_centers = []
+    valid_centers = []
     for time_idx in range(len(heatmaps)):
         centers = []
+        valid = []
         for batch_idx in range(batch):
-            boxes = targets[batch_idx][time_idx].get("boxes", torch.empty(0, 4))
+            clip = targets[batch_idx]
+            target = clip[min(time_idx, len(clip) - 1)] if clip else {"boxes": torch.empty(0, 4)}
+            boxes = target.get("boxes", torch.empty(0, 4))
             if boxes.numel() == 0:
                 centers.append(torch.zeros(2, dtype=dtype))
+                valid.append(False)
             else:
+                # Dataset targets are normalized cxcywh, so [:2] is the true center.
                 centers.append(boxes[0, :2].to(dtype=dtype))
+                valid.append(True)
         gt_centers.append(torch.stack(centers, dim=0).to(device))
+        valid_centers.append(torch.tensor(valid, dtype=torch.bool, device=device))
 
     pred_centers = [soft_argmax2d(heatmap, temperature) for heatmap in heatmaps]
     total = heatmaps[0].sum() * 0.0
+    valid_pairs = 0
     for time_idx in range(1, len(heatmaps)):
+        valid = valid_centers[time_idx - 1] & valid_centers[time_idx]
+        if not valid.any():
+            continue
         pred_delta = pred_centers[time_idx] - pred_centers[time_idx - 1]
         gt_delta = gt_centers[time_idx] - gt_centers[time_idx - 1]
-        total = total + (pred_delta - gt_delta).pow(2).sum(dim=1).mean()
-    return total / float(len(heatmaps) - 1)
+        total = total + F.mse_loss(pred_delta[valid], gt_delta[valid])
+        valid_pairs += 1
+    return total / float(max(valid_pairs, 1))

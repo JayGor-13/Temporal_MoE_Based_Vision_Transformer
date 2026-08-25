@@ -32,14 +32,23 @@ class MotionCNN(nn.Module):
                 ]
             )
             in_channels = out_channels
-        layers.extend([nn.Conv2d(in_channels, 1, kernel_size=1), nn.Sigmoid()])
+        final_conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+        nn.init.normal_(final_conv.weight, std=0.01)
+        nn.init.constant_(final_conv.bias, -2.19)
+        layers.extend([final_conv, nn.Sigmoid()])
         self.net = nn.Sequential(*layers)
 
     def forward(self, filtered_triplet: Tensor) -> Tensor:
         return self.net(filtered_triplet)
 
     @staticmethod
-    def make_gt_heatmap(boxes: Tensor, heatmap_size: tuple[int, int], sigma: float = 2.0) -> Tensor:
+    def make_gt_heatmap(
+        boxes: Tensor,
+        heatmap_size: tuple[int, int],
+        sigma: float = 2.0,
+        adaptive_sigma: bool = True,
+        min_sigma: float = 1.0,
+    ) -> Tensor:
         height, width = heatmap_size
         device = boxes.device
         dtype = boxes.dtype if boxes.is_floating_point() else torch.float32
@@ -50,6 +59,14 @@ class MotionCNN(nn.Module):
             return heatmap
         centers_x = (boxes[:, 0].clamp(0, 1) * (width - 1)).view(-1, 1, 1)
         centers_y = (boxes[:, 1].clamp(0, 1) * (height - 1)).view(-1, 1, 1)
-        gaussian = torch.exp(-((x - centers_x) ** 2 + (y - centers_y) ** 2) / (2.0 * sigma**2))
+        if adaptive_sigma and boxes.shape[-1] >= 4:
+            half_w = boxes[:, 2].clamp_min(0.0) * max(width - 1, 1) / 2.0
+            half_h = boxes[:, 3].clamp_min(0.0) * max(height - 1, 1) / 2.0
+            per_object_sigma = torch.maximum(half_w, half_h).div(3.0).clamp_min(min_sigma).view(-1, 1, 1)
+        else:
+            per_object_sigma = boxes.new_full((boxes.shape[0], 1, 1), float(sigma), dtype=dtype)
+        gaussian = torch.exp(
+            -((x - centers_x) ** 2 + (y - centers_y) ** 2) / (2.0 * per_object_sigma.square())
+        )
         heatmap[0] = gaussian.amax(dim=0)
         return heatmap.clamp(0.0, 1.0)

@@ -28,17 +28,65 @@ def match_detections(pred_boxes: Tensor, pred_scores: Tensor, gt_boxes: Tensor, 
     return tp, fp, fn
 
 
+def compute_ap(
+    predictions: list[dict[str, Tensor]],
+    targets: list[dict[str, Tensor]],
+    iou_threshold: float = 0.5,
+) -> float:
+    """Compute dataset-level 101-point interpolated average precision."""
+
+    scored_matches: list[tuple[float, int]] = []
+    total_ground_truth = 0
+    for prediction, target in zip(predictions, targets):
+        pred_boxes = prediction.get("boxes", torch.empty(0, 4)).detach().cpu()
+        scores = prediction.get("scores", torch.empty(0)).detach().cpu()
+        gt_boxes = target.get("boxes", torch.empty(0, 4)).detach().cpu()
+        total_ground_truth += int(gt_boxes.shape[0])
+        if pred_boxes.numel() == 0:
+            continue
+
+        order = torch.argsort(scores, descending=True)
+        matched_gt: set[int] = set()
+        ious = box_iou(pred_boxes[order], gt_boxes) if gt_boxes.numel() > 0 else None
+        for row_idx, prediction_idx in enumerate(order.tolist()):
+            matched = 0
+            if ious is not None and len(matched_gt) < gt_boxes.shape[0]:
+                candidate_ious = ious[row_idx].clone()
+                if matched_gt:
+                    candidate_ious[list(matched_gt)] = -1.0
+                best_iou, gt_idx = candidate_ious.max(dim=0)
+                if float(best_iou) >= iou_threshold:
+                    matched = 1
+                    matched_gt.add(int(gt_idx))
+            scored_matches.append((float(scores[prediction_idx]), matched))
+
+    if total_ground_truth == 0 or not scored_matches:
+        return 0.0
+
+    scored_matches.sort(key=lambda item: item[0], reverse=True)
+    matched = torch.tensor([item[1] for item in scored_matches], dtype=torch.float32)
+    cumulative_tp = matched.cumsum(dim=0)
+    cumulative_fp = (1.0 - matched).cumsum(dim=0)
+    recalls = cumulative_tp / float(total_ground_truth)
+    precisions = cumulative_tp / (cumulative_tp + cumulative_fp).clamp_min(1e-8)
+
+    ap = 0.0
+    for recall_level in torch.linspace(0.0, 1.0, 101):
+        eligible = recalls >= recall_level
+        ap += float(precisions[eligible].max()) if eligible.any() else 0.0
+    return ap / 101.0
+
+
 def detection_metrics(
     predictions: list[dict[str, Tensor]],
     targets: list[dict[str, Tensor]],
     score_threshold: float = 0.3,
 ) -> dict[str, float]:
     totals = {0.5: [0, 0, 0], 0.75: [0, 0, 0]}
-    fp_images = 0
     for pred, target in zip(predictions, targets):
-        scores = pred["scores"]
+        scores = pred.get("scores", torch.empty(0))
         keep = scores >= score_threshold
-        pred_boxes = pred["boxes"][keep]
+        pred_boxes = pred.get("boxes", torch.empty(0, 4))[keep]
         pred_scores = scores[keep]
         gt_boxes = target.get("boxes", torch.empty(0, 4, device=pred_boxes.device)).to(pred_boxes.device)
         for threshold in totals:
@@ -46,22 +94,19 @@ def detection_metrics(
             totals[threshold][0] += tp
             totals[threshold][1] += fp
             totals[threshold][2] += fn
-        fp_images += int(pred_boxes.shape[0])
 
     tp50, fp50, fn50 = totals[0.5]
     precision = tp50 / max(1, tp50 + fp50)
     recall = tp50 / max(1, tp50 + fn50)
     f1 = 2 * precision * recall / max(1e-8, precision + recall)
-    map50 = precision * recall
-    tp75, fp75, fn75 = totals[0.75]
-    precision75 = tp75 / max(1, tp75 + fp75)
-    recall75 = tp75 / max(1, tp75 + fn75)
+    map50 = compute_ap(predictions, targets, iou_threshold=0.5)
+    map75 = compute_ap(predictions, targets, iou_threshold=0.75)
     return {
         "precision": precision,
         "recall": recall,
         "f1": f1,
         "map50": map50,
-        "map75": precision75 * recall75,
+        "map75": map75,
         "false_positives_per_image": fp50 / max(1, len(predictions)),
     }
 

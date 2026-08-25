@@ -5,15 +5,29 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 
+SOBEL_X = torch.tensor(
+    [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+).view(1, 1, 3, 3)
+SOBEL_Y = torch.tensor(
+    [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+).view(1, 1, 3, 3)
+
+
 class LocalDifferentialMotion(nn.Module):
     """Parameter-free LDMI v2 preprocessing.
 
-    A triplet of RGB frames is converted into motion residuals, motion
-    magnitudes, scale hints, the current image, and appearance/disappearance
-    cues. For RGB input this produces 15 channels.
+    A triplet of infrared or RGB frames is converted into motion residuals,
+    motion magnitudes, scale hints, the current image, appearance/disappearance
+    cues, and an optional Sobel edge map of the newest frame difference. The
+    output has ``3C + 7`` channels with Sobel enabled and ``3C + 6`` without it.
     """
 
-    def __init__(self, image_channels: int = 3, scales: tuple[int, ...] = (15, 31)) -> None:
+    def __init__(
+        self,
+        image_channels: int = 1,
+        scales: tuple[int, ...] = (15, 31),
+        use_sobel_edge: bool = True,
+    ) -> None:
         super().__init__()
         if not scales:
             raise ValueError("At least one LDMI scale is required")
@@ -22,6 +36,9 @@ class LocalDifferentialMotion(nn.Module):
                 raise ValueError("LDMI scales must be positive odd integers")
         self.image_channels = image_channels
         self.scales = tuple(scales)
+        self.use_sobel_edge = use_sobel_edge
+        self.register_buffer("sobel_x", SOBEL_X, persistent=False)
+        self.register_buffer("sobel_y", SOBEL_Y, persistent=False)
 
     def _signed_residual_and_scale(self, diff: Tensor) -> tuple[Tensor, Tensor]:
         residuals = []
@@ -46,6 +63,14 @@ class LocalDifferentialMotion(nn.Module):
             scale = scale / float(len(self.scales) - 1)
         return residual, scale
 
+    def _compute_sobel_edge(self, diff: Tensor) -> Tensor:
+        gray_diff = diff.mean(dim=1, keepdim=True)
+        kernel_x = self.sobel_x.to(device=diff.device, dtype=diff.dtype)
+        kernel_y = self.sobel_y.to(device=diff.device, dtype=diff.dtype)
+        gx = F.conv2d(gray_diff, kernel_x, padding=1)
+        gy = F.conv2d(gray_diff, kernel_y, padding=1)
+        return torch.sqrt(gx.square() + gy.square() + 1e-8)
+
     def forward(self, triplet: Tensor) -> Tensor:
         channels = self.image_channels
         expected = channels * 3
@@ -67,17 +92,17 @@ class LocalDifferentialMotion(nn.Module):
         disappearance = torch.relu(old_strength - new_strength)
         appearance = torch.relu(new_strength - old_strength)
 
-        return torch.cat(
-            [
-                r_old,
-                m_old,
-                s_old,
-                f_curr,
-                s_new,
-                m_new,
-                r_new,
-                disappearance,
-                appearance,
-            ],
-            dim=1,
-        )
+        components = [
+            r_old,
+            m_old,
+            s_old,
+            f_curr,
+            s_new,
+            m_new,
+            r_new,
+            disappearance,
+            appearance,
+        ]
+        if self.use_sobel_edge:
+            components.append(self._compute_sobel_edge(d_new))
+        return torch.cat(components, dim=1)

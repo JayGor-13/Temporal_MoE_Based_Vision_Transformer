@@ -46,7 +46,7 @@ class DRISHTITrainer:
         lr: float,
         weight_decay: float = 1e-4,
         checkpoint_name: str | None = None,
-        resume_checkpoint: str | None = None,
+        resume_checkpoint: str | Path | None = None,
     ) -> list[dict[str, float]]:
         apply_training_stage(self.model, stage)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
@@ -55,17 +55,29 @@ class DRISHTITrainer:
         optimizer = AdamW(trainable, lr=lr, weight_decay=weight_decay)
         scheduler = make_scheduler(optimizer, epochs)
         history: list[dict[str, float]] = []
-        best_score = -1.0
-        
+        best_score = -float("inf")
+
         start_epoch = 1
-        if resume_checkpoint:
-            payload = torch.load(resume_checkpoint, map_location=self.device)
-            if isinstance(payload, dict):
-                start_epoch = payload.get("epoch", 0) + 1
-                if "optimizer" in payload:
-                    optimizer.load_state_dict(payload["optimizer"])
-                if "scheduler" in payload:
-                    scheduler.load_state_dict(payload["scheduler"])
+        if resume_checkpoint is not None:
+            resume_path = Path(resume_checkpoint)
+            if not resume_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
+            payload = torch.load(resume_path, map_location=self.device)
+            if not isinstance(payload, dict):
+                raise ValueError("A training resume checkpoint must be a state dictionary payload")
+            required = {"model", "optimizer", "scheduler", "epoch"}
+            missing = sorted(required - payload.keys())
+            if missing:
+                raise ValueError(f"Incomplete resume checkpoint; missing keys: {missing}")
+            checkpoint_stage = payload.get("stage")
+            if checkpoint_stage is not None and str(checkpoint_stage).lower() != stage.lower():
+                raise ValueError(f"Checkpoint stage {checkpoint_stage!r} does not match requested stage {stage!r}")
+            self.model.load_state_dict(payload["model"])
+            optimizer.load_state_dict(payload["optimizer"])
+            scheduler.load_state_dict(payload["scheduler"])
+            start_epoch = int(payload["epoch"]) + 1
+            best_score = float(payload.get("best_score", best_score))
+            print(f"Resumed {stage} from {resume_path} at epoch {start_epoch}")
 
         checkpoints_dir = self.output_dir / "checkpoints"
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -78,6 +90,7 @@ class DRISHTITrainer:
                 "heatmap",
                 "cls",
                 "bbox",
+                "offset",
                 "balance",
                 "motion_disp",
                 "temporal_consist",
@@ -99,8 +112,15 @@ class DRISHTITrainer:
                 loss_kwargs = {"targets": batch["targets"]}
                 params = inspect.signature(self.loss_fn.forward).parameters
                 accepts_extra = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
-                if accepts_extra or "all_heatmaps" in params:
-                    loss_kwargs["all_heatmaps"] = output.all_heatmaps
+                extras = {
+                    "all_heatmaps": output.all_heatmaps,
+                    "logits_seq": output.objectness_logits_seq,
+                    "centers_seq": output.proposal_centers_seq,
+                    "boxes_seq": output.boxes_seq,
+                }
+                for key, value in extras.items():
+                    if accepts_extra or key in params:
+                        loss_kwargs[key] = value
                 losses = self.loss_fn(output, **loss_kwargs)
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
@@ -144,12 +164,14 @@ class DRISHTITrainer:
             record["learning_rate"] = float(scheduler.get_last_lr()[0])
 
             if self.val_loader is not None:
-                evaluator = DRISHTIEvaluator(self.model, self.val_loader, device=self.device)
-                metrics = evaluator.evaluate(
-                    print_results=False,
-                    output_path=self.output_dir / f"{stage}_eval_metrics.json",
-                    save_visualizations=True,
-                )
+                self.model.eval()
+                with torch.no_grad():
+                    evaluator = DRISHTIEvaluator(self.model, self.val_loader, device=self.device)
+                    metrics = evaluator.evaluate(
+                        print_results=False,
+                        output_path=self.output_dir / f"{stage}_eval_metrics.json",
+                        save_visualizations=True,
+                    )
                 record.update({f"val_{key}": float(value) for key, value in metrics.items() if isinstance(value, (int, float))})
                 score = float(metrics.get("map50", 0.0))
             else:
@@ -161,21 +183,59 @@ class DRISHTITrainer:
             print(json.dumps(record, indent=2, sort_keys=True))
             if score > best_score:
                 best_score = score
-                self.save_checkpoint(checkpoints_dir / f"{stage}_best.pt", epoch, record, optimizer, scheduler)
+                best_filename = checkpoint_name or f"{stage}_best.pt"
+                self.save_checkpoint(
+                    checkpoints_dir / best_filename,
+                    epoch,
+                    record,
+                    optimizer,
+                    scheduler,
+                    stage=stage,
+                    best_score=best_score,
+                )
             
-            self.save_checkpoint(checkpoints_dir / f"{stage}_latest.pt", epoch, record, optimizer, scheduler)
+            self.save_checkpoint(
+                checkpoints_dir / f"{stage}_latest.pt",
+                epoch,
+                record,
+                optimizer,
+                scheduler,
+                stage=stage,
+                best_score=best_score,
+            )
             
             if epoch == 1 or epoch % 10 == 0:
-                self.save_checkpoint(checkpoints_dir / f"{stage}_epoch_{epoch}.pt", epoch, record, optimizer, scheduler)
+                self.save_checkpoint(
+                    checkpoints_dir / f"{stage}_epoch_{epoch}.pt",
+                    epoch,
+                    record,
+                    optimizer,
+                    scheduler,
+                    stage=stage,
+                    best_score=best_score,
+                )
         return history
 
-    def save_checkpoint(self, path: Path, epoch: int, metrics: dict[str, Any], optimizer=None, scheduler=None) -> None:
+    def save_checkpoint(
+        self,
+        path: Path,
+        epoch: int,
+        metrics: dict[str, Any],
+        optimizer=None,
+        scheduler=None,
+        stage: str | None = None,
+        best_score: float | None = None,
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"epoch": epoch, "model": self.model.state_dict(), "metrics": metrics}
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         if scheduler is not None:
             payload["scheduler"] = scheduler.state_dict()
+        if stage is not None:
+            payload["stage"] = stage
+        if best_score is not None:
+            payload["best_score"] = best_score
         torch.save(payload, path)
 
     def _append_csv(self, record: dict[str, float]) -> None:
@@ -212,6 +272,7 @@ class DRISHTITrainer:
             "loss/heatmap": self._loss_value(losses, "heatmap", zero),
             "loss/cls": self._loss_value(losses, "cls", zero),
             "loss/bbox": self._loss_value(losses, "bbox", zero),
+            "loss/offset": self._loss_value(losses, "offset", zero),
             "loss/balance": self._loss_value(losses, "balance", zero),
             "loss/motion_disp": self._loss_value(losses, "motion_disp", zero),
             "loss/temporal_consist": self._loss_value(losses, "temporal_consist", zero),

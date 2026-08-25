@@ -43,6 +43,7 @@ def build_loader(
     clip_stride: int | None = None,
     frame_stride: int | None = None,
     box_format: str | None = None,
+    augment: bool | None = None,
 ) -> DataLoader:
     data_root = data_root or config.data_root
     frames_root = frames_root or config.frames_root
@@ -50,6 +51,7 @@ def build_loader(
     clip_stride = config.clip_stride if clip_stride is None else clip_stride
     frame_stride = config.frame_stride if frame_stride is None else frame_stride
     box_format = box_format or config.box_format
+    augment = split == "train" if augment is None else augment
 
     if frames_root:
         dataset = AntiUAVExtractedFrameDataset(
@@ -63,6 +65,7 @@ def build_loader(
             frame_stride=frame_stride,
             image_channels=config.image_channels,
             box_format=box_format,
+            augment=augment,
         )
     elif data_root:
         dataset = AntiUAVRGBTVideoDataset(
@@ -76,6 +79,7 @@ def build_loader(
             frame_stride=frame_stride,
             image_channels=config.image_channels,
             box_format=box_format,
+            augment=augment,
         )
     elif synthetic:
         smoke_height = min(config.image_height, 64)

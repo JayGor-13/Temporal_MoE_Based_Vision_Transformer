@@ -80,6 +80,7 @@ class CropProposalEngine(nn.Module):
         batch, channels, height, width = frame.shape
         num_crops = centers.shape[1]
         crop_size = self.config.crop_size
+        scales = self.config.crop_scales
         dtype = frame.dtype
         device = frame.device
 
@@ -100,14 +101,25 @@ class CropProposalEngine(nn.Module):
         # Optimize memory usage by preventing full frame replication
         # We reshape grid to (batch, num_crops * crop_size, crop_size, 2) so grid_sample can process 
         # the entire batch without needing to replicate the high-resolution frame.
-        grid = (base + offset_grid).reshape(batch, num_crops * crop_size, crop_size, 2)
-        
-        # sampled shape will be (batch, channels, num_crops * crop_size, crop_size)
-        sampled = F.grid_sample(frame, grid, mode="bilinear", padding_mode="border", align_corners=True)
-        
-        # Reshape and transpose to final required output shape: (batch * num_crops, channels, crop_size, crop_size)
-        sampled = sampled.view(batch, channels, num_crops, crop_size, crop_size)
-        return sampled.transpose(1, 2).reshape(batch * num_crops, channels, crop_size, crop_size)
+        multi_scale = []
+        for scale in scales:
+            grid = (base + offset_grid * scale).reshape(batch, num_crops * crop_size, crop_size, 2)
+            sampled = F.grid_sample(
+                frame,
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=True,
+            )
+            multi_scale.append(sampled.view(batch, channels, num_crops, crop_size, crop_size))
+
+        stacked = torch.cat(multi_scale, dim=1)
+        return stacked.transpose(1, 2).reshape(
+            batch * num_crops,
+            channels * len(scales),
+            crop_size,
+            crop_size,
+        )
 
     def _append(
         self,

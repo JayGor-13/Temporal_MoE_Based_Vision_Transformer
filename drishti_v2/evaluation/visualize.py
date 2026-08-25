@@ -15,6 +15,8 @@ def save_detection_figure(frame: Tensor, boxes: Tensor, scores: Tensor, path: st
     """Save a simple detection overlay for debugging."""
 
     image = frame.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+    if image.ndim == 3 and image.shape[-1] == 1:
+        image = image.squeeze(-1)
     height, width = image.shape[:2]
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.imshow(image)
@@ -127,6 +129,8 @@ def draw_boxes_on_image(
             array = np.clip(array * 255, 0, 255).astype(np.uint8)
     if array.ndim == 2:
         array = np.repeat(array[..., None], 3, axis=-1)
+    elif array.ndim == 3 and array.shape[-1] == 1:
+        array = np.repeat(array, 3, axis=-1)
     height, width = array.shape[:2]
     output = array.copy()
 

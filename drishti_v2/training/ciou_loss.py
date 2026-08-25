@@ -17,8 +17,8 @@ def ciou_loss(pred_boxes: Tensor, gt_boxes: Tensor, eps: float = 1e-7) -> Tensor
     if pred_boxes.numel() == 0:
         return pred_boxes.sum() * 0.0
 
-    pred_boxes = pred_boxes.clamp(0.0, 1.0)
-    gt_boxes = gt_boxes.clamp(0.0, 1.0)
+    pred_boxes = torch.cat([pred_boxes[..., :2], pred_boxes[..., 2:].clamp_min(eps)], dim=-1)
+    gt_boxes = torch.cat([gt_boxes[..., :2], gt_boxes[..., 2:].clamp_min(eps)], dim=-1)
     pred_xyxy = _cxcywh_to_xyxy(pred_boxes)
     gt_xyxy = _cxcywh_to_xyxy(gt_boxes)
 

@@ -46,6 +46,8 @@ class SparseMoE(nn.Module):
         ffn_dim: int = 512,
         dropout: float = 0.1,
         dense: bool = False,
+        num_sources: int = 5,
+        use_source_bias: bool = True,
     ) -> None:
         super().__init__()
         if top_k < 1 or top_k > num_experts:
@@ -53,7 +55,9 @@ class SparseMoE(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.dense = dense
+        self.use_source_bias = use_source_bias
         self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.source_bias = nn.Embedding(num_sources, num_experts) if use_source_bias else None
         self.experts = nn.ModuleList([Expert(d_model, ffn_dim, dropout) for _ in range(num_experts)])
 
     def _diagnostics(self, probs: Tensor, dispatch: Tensor, balance_loss: Tensor, z_loss: Tensor) -> MoEDiagnostics:
@@ -82,10 +86,17 @@ class SparseMoE(nn.Module):
             router_z_loss=z_loss,
         )
 
-    def forward(self, x: Tensor) -> tuple[Tensor, MoEDiagnostics]:
+    def forward(self, x: Tensor, source_labels: Tensor | None = None) -> tuple[Tensor, MoEDiagnostics]:
         *leading, dim = x.shape
         x_flat = x.reshape(-1, dim)
         router_logits = self.router(x_flat)
+        if self.source_bias is not None and source_labels is not None:
+            if source_labels.numel() != x_flat.shape[0]:
+                raise ValueError(
+                    f"source_labels has {source_labels.numel()} entries for {x_flat.shape[0]} tokens"
+                )
+            source_ids = source_labels.reshape(-1).to(dtype=torch.long).clamp(0, self.source_bias.num_embeddings - 1)
+            router_logits = router_logits + self.source_bias(source_ids)
         z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
         probs = torch.softmax(router_logits, dim=-1)
 
@@ -97,8 +108,9 @@ class SparseMoE(nn.Module):
             return out.reshape(*leading, dim), diagnostics
 
         top_probs, top_indices = probs.topk(self.top_k, dim=-1)
-        top_weights = top_probs / top_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        out = torch.zeros_like(x_flat)
+        # Direct probabilities retain task-loss gradients when top_k == 1.
+        top_weights = top_probs
+        combined = torch.zeros_like(x_flat)
 
         for rank in range(self.top_k):
             expert_ids = top_indices[:, rank]
@@ -106,12 +118,13 @@ class SparseMoE(nn.Module):
             for expert_idx, expert in enumerate(self.experts):
                 mask = expert_ids == expert_idx
                 if mask.any():
-                    out[mask] += expert(x_flat[mask]) * weights[mask].unsqueeze(-1)
+                    token_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                    expert_output = expert(x_flat[token_indices]) * weights[mask].unsqueeze(-1)
+                    combined = combined.index_add(0, token_indices, expert_output)
 
-        dispatch = torch.zeros_like(probs)
-        dispatch.scatter_add_(1, top_indices, torch.ones_like(top_probs))
+        dispatch = torch.zeros_like(probs).scatter_add(1, top_indices, torch.ones_like(top_probs))
         fraction = dispatch.mean(dim=0) / float(self.top_k)
         probability = probs.mean(dim=0)
         balance_loss = self.num_experts * torch.sum(fraction * probability)
         diagnostics = self._diagnostics(probs, dispatch / float(self.top_k), balance_loss, z_loss)
-        return out.reshape(*leading, dim), diagnostics
+        return combined.reshape(*leading, dim), diagnostics

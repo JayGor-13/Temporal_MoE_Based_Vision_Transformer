@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from drishti_v2.assignment import linear_sum_assignment
+
 
 @dataclass
 class Track:
@@ -16,6 +18,7 @@ class Track:
     age: int = 0
     coast_count: int = 0
     hit_count: int = 1
+    last_unpredicted_center: Tensor | None = None
 
 
 class SimpleTracker:
@@ -30,6 +33,7 @@ class SimpleTracker:
 
     def predict(self) -> None:
         for track in self.tracks:
+            track.last_unpredicted_center = track.center.clone()
             track.center = (track.center + track.velocity.to(track.center.device)).clamp(0.0, 1.0)
             track.coast_count += 1
             track.age += 1
@@ -45,19 +49,22 @@ class SimpleTracker:
         matched_det: set[int] = set()
         matched_track: set[int] = set()
 
-        for track_idx, track in enumerate(self.tracks):
-            best_dist = float("inf")
-            best_det = -1
-            for det_idx, det in enumerate(det_boxes):
-                if det_idx in matched_det:
-                    continue
-                dist = torch.norm(track.center.to(det.device) - det[:2]).item()
-                if dist < best_dist:
-                    best_dist = dist
-                    best_det = det_idx
-            if best_det >= 0 and best_dist < self.dist_threshold:
+        if self.tracks and det_boxes.numel() > 0:
+            track_centers = torch.stack([track.center.to(det_boxes.device) for track in self.tracks])
+            cost = torch.cdist(track_centers, det_boxes[:, :2])
+            track_indices, detection_indices = linear_sum_assignment(cost)
+        else:
+            track_indices = torch.empty(0, dtype=torch.long, device=det_boxes.device)
+            detection_indices = torch.empty(0, dtype=torch.long, device=det_boxes.device)
+
+        for track_idx, best_det in zip(track_indices.tolist(), detection_indices.tolist()):
+            if float(cost[track_idx, best_det]) < self.dist_threshold:
+                track = self.tracks[track_idx]
                 new_center = det_boxes[best_det, :2].clone()
-                track.velocity = (new_center - track.center.to(new_center.device)).detach()
+                previous_center = track.last_unpredicted_center
+                if previous_center is None:
+                    previous_center = track.center
+                track.velocity = (new_center - previous_center.to(new_center.device)).detach()
                 track.center = new_center
                 track.size = det_boxes[best_det, 2:].clone()
                 track.confidence = float(det_confs[best_det].item())
